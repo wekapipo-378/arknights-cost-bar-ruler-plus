@@ -47,14 +47,7 @@ pub(super) fn populate_captions(
     wizard.set_cap_start(i18n.tr("config.btn.save_start").into());
     wizard.set_cap_cancel(i18n.tr("config.btn.cancel").into());
     wizard.set_preview_placeholder(i18n.tr("config.window.preview.unavailable").into());
-    wizard.set_cap_telemetry(i18n.tr("config.selector.telemetry").into());
-    wizard.set_cap_telemetry_hint(i18n.tr("config.selector.telemetry_hint").into());
     wizard.set_auto_checked(false);
-    wizard.set_telemetry_checked(
-        previous_config
-            .and_then(|config| config.telemetry_enabled)
-            .unwrap_or(true),
-    );
 
     // adb-unavailable banner text. The flag itself is updated in
     // `sync_to_slint` based on `ruler_core::capture::adb_resolver::adb_available()`.
@@ -281,7 +274,6 @@ pub(super) fn wire_callbacks(
         move || {
             let wizard = weak.upgrade().expect("wizard dropped");
             let auto = wizard.get_auto_checked();
-            let telemetry_enabled = wizard.get_telemetry_checked();
             let record_video = wizard.get_record_video();
             let record_csv = wizard.get_record_csv();
             let trace_logging = wizard.get_trace_logging();
@@ -301,7 +293,7 @@ pub(super) fn wire_callbacks(
                     record_video,
                     record_csv,
                     trace_logging,
-                    telemetry_enabled,
+                    telemetry_enabled: false,
                 };
                 let core_ref = core.borrow();
                 let built = build_manual_config(
@@ -334,7 +326,7 @@ pub(super) fn wire_callbacks(
                     .or_else(|| Some(core.i18n.locale().to_string()));
                 config.auto_select_target = auto;
                 config.target_fingerprint = Some(candidate.fingerprint.clone());
-                config.telemetry_enabled = Some(telemetry_enabled);
+                config.telemetry_enabled = Some(false);
                 config.screenshot_delay_ms = candidate
                     .latency
                     .map(|latency| latency.as_secs_f64() * 1000.0);
@@ -437,6 +429,11 @@ fn build_manual_config(
         window_class: None,
         active_calibration_profile: previous
             .and_then(|config| config.active_calibration_profile.clone()),
+        active_axis: previous.and_then(|config| config.active_axis.clone()),
+        pause_lead_frames: previous.and_then(|config| config.pause_lead_frames),
+        hotkey_record_frame: previous.and_then(|config| config.hotkey_record_frame.clone()),
+        hotkey_pause_mode: previous.and_then(|config| config.hotkey_pause_mode.clone()),
+        hotkey_lap: previous.and_then(|config| config.hotkey_lap.clone()),
         frame_display_mode: previous
             .and_then(|config| config.frame_display_mode.clone())
             .or_else(|| Some("0_to_n-1".to_string())),
@@ -528,7 +525,7 @@ mod tests {
     fn manual_draft(kind: i32) -> ManualDraft {
         ManualDraft {
             kind,
-            telemetry_enabled: true,
+            telemetry_enabled: false,
             install_path: String::new(),
             instance_index: String::new(),
             device_id: String::new(),

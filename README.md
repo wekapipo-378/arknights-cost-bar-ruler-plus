@@ -1,4 +1,12 @@
-# Arknights Cost Bar Ruler (明日方舟费用条尺子)
+# Cost Bar Ruler Plus（费用条尺子 Plus）
+
+> **本发行版基于 [Z_06 / ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler) 修改，由 威猛先生 维护。**
+> 原项目采用 MIT 许可，原始版权归 Z_06 所有；本发行版保留全部原始版权声明与第三方许可（见 `LICENSE` / `LICENSES/`）。
+>
+> 主要改动：移除匿名统计与联网更新检查、重做设置界面（校准 / 外观 / 快捷键 / 关于）、
+> 重写轴窗口交互（行内改名、注释、标题改名）、新增全局快捷键、悬浮窗暂停提示与标记注释等。
+>
+> 维护者主页：[B 站](https://space.bilibili.com/440985091) · [GitHub](https://github.com/wekapipo-378)
 
 
 一个为《明日方舟》设计的悬浮窗工具，通过观察费用条的变化来测量当前关卡内的帧数，帮助你复刻那些卡帧的极限操作。
@@ -30,7 +38,7 @@
 
 ### 下载运行
 
-前往 [Releases 页面](https://github.com/ZeroAd-06/ArknightsCostBarRuler/releases) 下载最新发行版，解压后直接运行里面的 `ruler-app.exe` 即可。
+前往 [Releases 页面](https://github.com/wekapipo-378/arknights-cost-bar-ruler-plus/releases) 下载最新发行版，解压后直接运行里面的 `CostBarRulerPlus.exe` 即可。
 
 ### 从源码构建
 
@@ -45,7 +53,7 @@
 cargo build --release -p ruler-app
 ```
 
-产物在 `target/release/ruler-app.exe`。
+产物在 `target/release/CostBarRulerPlus.exe`。
 
 也可以用仓库自带的打包脚本，它会顺手把 `icons/`、`ruler/locales/` 和许可证文件一起塞进 `dist/`:
 
@@ -147,7 +155,7 @@ cargo run --release -p ruler-app
 这是一个 Cargo workspace，拆成四个 crate:
 
 ```
-ArknightsCostBarRuler/
+CostBarRulerPlus/
 ├── Cargo.toml              # workspace 根配置
 ├── build.ps1               # 构建 + 打包脚本
 ├── docs/                   # 延伸文档与 API 说明
@@ -177,7 +185,7 @@ ArknightsCostBarRuler/
   - 关掉重开。
   - 删掉当前工作目录里的 `config.json` 重新走一遍配置向导。
   - 用 `--debug` 打开调试向导，按需开启 **超级详细日志**、CSV，必要时再勾一次性 MKV。
-  - 带上最新的 `log\<timestamp>_<pid>\` 会话目录，到 [Issue 页面](https://github.com/ZeroAd-06/ArknightsCostBarRuler/issues) 给我报个问题。
+  - 带上最新的 `log\<timestamp>_<pid>\` 会话目录，到 [Issue 页面](https://github.com/wekapipo-378/arknights-cost-bar-ruler-plus/issues) 报个问题。
 - 关于作者本人:
   - 我是个 6 周年才入坑的小登，游戏理解顶多算个中杯，只打过一次合约，也不确定这工具是否真的符合极限玩家的需求。
   - 所以如果你觉得它显示的帧数跟你预期的对不上，那很有可能是我的问题 (・_・;)

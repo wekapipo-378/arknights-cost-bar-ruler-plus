@@ -10,19 +10,22 @@ pub mod win32 {
     use std::mem;
 
     use crate::icons::{win32::create_icon, IconSet};
-    use windows::Win32::{
-        Foundation::{HINSTANCE, HWND},
-        UI::{
-            Shell::{
-                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-                NOTIFYICONDATAW,
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM},
+            UI::{
+                Shell::{
+                    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                    NOTIFYICONDATAW,
+                },
+                WindowsAndMessaging::{DestroyIcon, LoadIconW, HICON, IDI_APPLICATION},
             },
-            WindowsAndMessaging::{DestroyIcon, LoadIconW, HICON, IDI_APPLICATION},
         },
     };
 
     /// Default tooltip (app name). Status text replaces it on demand.
-    const DEFAULT_TIP: &str = "明日方舟费用条尺子";
+    const DEFAULT_TIP: &str = "费用条尺子 Plus";
 
     /// Register a tray icon bound to `hwnd`, delivering `callback_msg` on
     /// interaction. Returns the notify-icon data (needed for later modify/delete)
@@ -59,18 +62,53 @@ pub mod win32 {
         }
     }
 
-    /// Update the hover tooltip text.
-    pub unsafe fn update_tooltip(nid: &mut NOTIFYICONDATAW, text: &str) {
-        nid.szTip = tooltip_text(text);
-        let _ = Shell_NotifyIconW(NIM_MODIFY, nid);
-    }
-
     /// Remove the tray icon and free the custom HICON.
     pub unsafe fn remove(nid: &NOTIFYICONDATAW, custom_icon: Option<HICON>) {
         let _ = Shell_NotifyIconW(NIM_DELETE, nid);
         if let Some(icon) = custom_icon {
             let _ = DestroyIcon(icon);
         }
+    }
+
+    /// Show the standard Windows context menu at the cursor and return the
+    /// chosen command id (0 when dismissed).
+    pub unsafe fn show_context_menu(hwnd: HWND) -> u32 {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW,
+            SetForegroundWindow, TrackPopupMenu, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+            TPM_RIGHTBUTTON, WM_NULL,
+        };
+
+        let Ok(menu) = CreatePopupMenu() else {
+            return 0;
+        };
+        let settings = wide("设置");
+        let axes = wide("轴列表");
+        let quit = wide("退出");
+        let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(settings.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(axes.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(quit.as_ptr()));
+
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let _ = SetForegroundWindow(hwnd);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            hwnd,
+            None,
+        );
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        command.0 as u32
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     fn tooltip_text(status: &str) -> [u16; 128] {

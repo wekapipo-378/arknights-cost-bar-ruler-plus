@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, TryRecvError},
@@ -18,8 +18,7 @@ use crate::{
     profiles::ProfileStore,
     resources::ResourceLocator,
     ui_state::{
-        ApiFrameLookup, ApiFrameRecord, ApiHistoryBounds, ApiStateSnapshot, UiSnapshot,
-        UpdateNotice,
+        ApiFrameLookup, ApiFrameRecord, ApiHistoryBounds, ApiStateSnapshot, PauseMark, UiSnapshot,
     },
 };
 
@@ -27,6 +26,8 @@ use crate::{
 pub struct WorkerTimingSnapshot {
     pub sample_index: u64,
 }
+
+const DEFAULT_AXIS_NAME: &str = "轴1";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OverlayTimingSnapshot {
@@ -40,6 +41,7 @@ pub struct AppStateSnapshot {
     pub api: ApiStateSnapshot,
     pub worker_timing: WorkerTimingSnapshot,
     pub overlay_timing: OverlayTimingSnapshot,
+    pub target_hwnd: isize,
 }
 
 #[derive(Default)]
@@ -50,6 +52,14 @@ pub struct SharedAppState {
     // One-shot flag set by the UI to abort an in-flight calibration loop.
     // The worker polls it inside `collect_calibration_samples` and bails out.
     cancel_calibration: AtomicBool,
+    // Set while the user is editing the timer in the settings dialog: the HUD
+    // must not fire the automatic pause in that moment.
+    auto_pause_suspended: AtomicBool,
+    // True while the worker owns the HUD with the PreCalibration screen. The
+    // analyzer thread checks this before publishing, so a frame that was already
+    // in flight (with the previous calibration still loaded) cannot flip the
+    // overlay back to Running.
+    precalibration_active: AtomicBool,
 }
 
 impl fmt::Debug for SharedAppState {
@@ -150,9 +160,37 @@ impl SharedAppState {
                 .loaded_config
                 .as_ref()
                 .and_then(|config| config.overlay_scale)
-                .map(|mult| (mult * 100.0).round().clamp(50.0, 400.0) as u16)
+                .map(|mult| (mult * 100.0).round().clamp(50.0, 200.0) as u16)
                 .unwrap_or(100);
+            // Only names that were explicitly chosen/renamed are shown: the plain
+            // "轴1"/"轴2" defaults stay hidden (the user's explicit preference).
+            state.ui.active_axis_name = startup
+                .loaded_config
+                .as_ref()
+                .and_then(|config| config.active_axis.clone())
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            state.ui.active_profile = startup
+                .loaded_config
+                .as_ref()
+                .and_then(|config| config.active_calibration_profile.clone());
             state.ui.cursor_blocked = false;
+            state.ui.pause_lead_frames = startup
+                .loaded_config
+                .as_ref()
+                .and_then(|config| config.pause_lead_frames)
+                .unwrap_or(crate::ui_state::DEFAULT_PAUSE_LEAD_FRAMES);
+            if let Some(config) = startup.loaded_config.as_ref() {
+                state.ui.hotkey_record_frame = config
+                    .hotkey_record_frame
+                    .clone()
+                    .unwrap_or_default();
+                state.ui.hotkey_pause_mode = config
+                    .hotkey_pause_mode
+                    .clone()
+                    .unwrap_or_default();
+                state.ui.hotkey_lap = config.hotkey_lap.clone().unwrap_or_default();
+            }
         }
         self.notify_overlay();
     }
@@ -178,8 +216,39 @@ impl SharedAppState {
         self.update_ui(|ui, _| ui.should_exit = true);
     }
 
-    pub fn set_update_notice(&self, notice: Option<UpdateNotice>) {
-        self.update_ui(|ui, _| ui.update_notice = notice);
+    /// Suspend/resume the automatic pause while the timer is being adjusted.
+    pub fn set_auto_pause_suspended(&self, suspended: bool) {
+        self.auto_pause_suspended.store(suspended, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn auto_pause_suspended(&self) -> bool {
+        self.auto_pause_suspended.load(Ordering::SeqCst)
+    }
+
+    /// Mark/unmark the "worker owns the PreCalibration screen" window.
+    pub fn set_precalibration_active(&self, active: bool) {
+        self.precalibration_active.store(active, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn precalibration_active(&self) -> bool {
+        self.precalibration_active.load(Ordering::SeqCst)
+    }
+
+    pub fn set_target_hwnd(&self, hwnd: isize) {
+        self.inner
+            .lock()
+            .expect("shared app state poisoned")
+            .target_hwnd = hwnd;
+    }
+
+    #[must_use]
+    pub fn target_hwnd(&self) -> isize {
+        self.inner
+            .lock()
+            .expect("shared app state poisoned")
+            .target_hwnd
     }
 
     /// Set the one-shot cancel flag for an in-flight calibration. The worker
@@ -345,7 +414,6 @@ use crate::{
         DebugRecorder, DebugRecorderConfig, DebugRecorderConsumer, DebugRecordingPlan,
     },
     profiles::calibration_basename,
-    telemetry::{self, RunTelemetryStats},
     ui_state::{FrameDisplayMode, OverlayMode},
 };
 
@@ -355,6 +423,8 @@ use crate::{
 struct WorkerContext {
     config: RulerConfig,
     config_path: PathBuf,
+    frame_marks_path: PathBuf,
+    axes_dir: PathBuf,
     profiles: ProfileStore,
     active_profile: Option<String>,
     display_mode: FrameDisplayMode,
@@ -365,7 +435,6 @@ struct WorkerContext {
     analyzer_command_tx: Option<Sender<AnalyzerCommand>>,
     analyzer: Option<AnalyzerConsumer>,
     debug_recorder: Option<DebugRecorderConsumer>,
-    telemetry_stats: Arc<RunTelemetryStats>,
 }
 
 fn run_worker_loop(
@@ -385,6 +454,15 @@ fn run_worker_loop(
     };
 
     let profiles = ProfileStore::new(&resources);
+    let axes_dir = resources.axes_dir();
+    let _ = std::fs::create_dir_all(&axes_dir);
+    migrate_legacy_frame_marks(&axes_dir, &resources.frame_marks_path());
+    let axis_name = config
+        .active_axis
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_AXIS_NAME.to_string());
+    let frame_marks_path = axes_dir.join(format!("{axis_name}.txt"));
     let session_id = format!(
         "{}",
         SystemTime::now()
@@ -398,6 +476,8 @@ fn run_worker_loop(
         active_profile: config.active_calibration_profile.clone(),
         config,
         config_path: resources.config_path(),
+        frame_marks_path,
+        axes_dir,
         profiles,
         log_session_dir,
         session_id,
@@ -406,17 +486,30 @@ fn run_worker_loop(
         analyzer_command_tx: None,
         analyzer: None,
         debug_recorder: None,
-        telemetry_stats: Arc::new(RunTelemetryStats::default()),
     };
 
     if let Err(error) = bootstrap(&mut context, Arc::clone(&state)) {
         publish_error(&state, &context, error);
     }
+    // Seed the marks of the active axis so the HUD can show notes and the next
+    // mark frame before the user toggles pause mode or re-selects an axis.
+    {
+        let marks = load_pause_marks(&context.frame_marks_path);
+        state.update_ui(|ui, _| {
+            ui.pause_marks = marks;
+            ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+        });
+    }
 
     let mut next_poll_at = Instant::now();
+    let mut last_mark_reload_at = Instant::now();
     while running.load(Ordering::Relaxed) {
         if !drain_commands(&state, &mut context, &commands, &running) {
             break;
+        }
+        if last_mark_reload_at.elapsed() >= Duration::from_secs(1) {
+            last_mark_reload_at = Instant::now();
+            reload_pause_marks(&state, &context);
         }
         next_poll_at = next_poll_at.max(Instant::now()) + interval;
         sleep_until(next_poll_at, &running);
@@ -430,11 +523,6 @@ fn run_worker_loop(
     drop(context.debug_recorder.take());
     if let Some(mut pipeline) = context.pipeline.take() {
         pipeline.shutdown();
-    }
-    if let Err(error) =
-        telemetry::write_session_stats(&context.log_session_dir, &context.telemetry_stats)
-    {
-        log::warn!("{error}");
     }
 }
 
@@ -475,7 +563,12 @@ fn bootstrap(context: &mut WorkerContext, state: Arc<SharedAppState>) -> Result<
         info.height,
         info.pipe_name
     );
-    telemetry::send_startup_telemetry(&context.config, &info, &context.log_session_dir);
+    state.set_target_hwnd(
+        info.window_info
+            .map(|window| window.hwnd)
+            .or(context.config.window_handle)
+            .unwrap_or(0),
+    );
     state.update_ui(|ui, _| {
         ui.capture_dimensions = Some((info.width, info.height));
         ui.cursor_blocked = false;
@@ -514,7 +607,6 @@ fn bootstrap(context: &mut WorkerContext, state: Arc<SharedAppState>) -> Result<
         ui_scaler,
         calibration_path: initial_cal_path,
         pipeline_info: info.clone(),
-        telemetry_stats: Arc::clone(&context.telemetry_stats),
         #[cfg(windows)]
         cursor_guard,
     };
@@ -620,36 +712,49 @@ fn handle_command(
         UiCommand::PrepareCalibration => {
             log::info!("worker command: prepare calibration");
             state.clear_api_frame_history();
-            context.active_profile = None;
-            context.config.active_calibration_profile = None;
+            // Keep the profile that is currently in use: 新建 calibrates a *new*
+            // profile, and the existing one stays selected/usable until the new
+            // calibration is saved. Clearing it here made the dialog look like it
+            // just deselected the active entry (and the HUD fell back to idle).
             send_analyzer(context, AnalyzerCommand::ClearCalibration);
+            // Silence the analyzer for the whole PreCalibration window via a flag of
+            // our own. (Toggling `SetCalibrating` here left the analyzer permanently
+            // silent whenever a calibration was prepared but never started, which is
+            // why "新建" sometimes appeared to do nothing.)
+            state.set_precalibration_active(true);
             send_analyzer(
                 context,
                 AnalyzerCommand::SetCalibrating { calibrating: false },
             );
             persist_config(context, "prepare calibration");
+            let active = context.active_profile.clone();
             state.update_ui(|ui, api| {
                 ui.mode = OverlayMode::PreCalibration;
                 ui.message.clear();
                 ui.progress_percent = 0.0;
-                ui.active_profile = None;
+                ui.active_profile = active.clone();
                 ui.total_frames_in_cycle = 0;
                 ui.can_undo_reset = false;
                 ui.cursor_blocked = false;
-                ui.profiles = context.profiles.list(None);
+                ui.profiles = context.profiles.list(active.as_deref());
                 api.is_running = false;
                 api.current_frame = None;
-                api.active_profile = None;
+                api.active_profile = active.as_deref().map(calibration_basename);
                 api.clear_frame_metadata();
             });
         }
         UiCommand::StartCalibration => {
             log::info!("worker command: start calibration");
+            // The analyzer takes over again from here (the collector owns the HUD
+            // during calibration, see the `calibrating` flag in the analyzer).
+            state.set_precalibration_active(false);
             match run_calibration(state, context) {
                 Ok(()) => publish_running_state(state, context),
                 Err(ref error) if error == calibration::CALIBRATION_CANCELLED => {
                     log::info!("calibration cancelled by user, returning to PreCalibration");
                     let _ = state.take_cancel_calibration();
+                    // Back to the worker-owned PreCalibration screen.
+                    state.set_precalibration_active(true);
                     state.update_ui(|ui, api| {
                         ui.mode = OverlayMode::PreCalibration;
                         ui.progress_percent = 0.0;
@@ -728,35 +833,125 @@ fn handle_command(
             context.config.frame_display_mode = Some(mode.as_config().to_string());
             send_analyzer(context, AnalyzerCommand::SetDisplayMode(mode));
             persist_config(context, "set display mode");
-            publish_current_state(state, context);
+            // Only touch the display-mode field. Republishing the whole overlay
+            // state here used to overwrite PreCalibration with Idle/Running, which
+            // made "新建校准" look like it never entered the calibration prompt.
+            state.update_ui(|ui, _| ui.display_mode = mode);
         }
         UiCommand::AdjustTimer { frames } => {
             log::info!("worker command: adjust timer by {frames} frames");
+            disable_pause_mode(state);
             send_analyzer(context, AnalyzerCommand::AdjustTimer { frames });
         }
         UiCommand::SetTimer { frames } => {
             log::info!("worker command: set timer to {frames} frames");
+            disable_pause_mode(state);
             send_analyzer(context, AnalyzerCommand::SetTimer { frames });
         }
         UiCommand::ResetTimer => {
             log::info!("worker command: reset timer");
+            disable_pause_mode(state);
             state.clear_api_frame_history();
             send_analyzer(context, AnalyzerCommand::ResetTimer);
         }
         UiCommand::UndoResetTimer => {
             log::info!("worker command: undo timer reset");
+            disable_pause_mode(state);
             send_analyzer(context, AnalyzerCommand::UndoResetTimer);
         }
         UiCommand::ToggleLapTimer => {
             log::info!("worker command: toggle lap timer");
             send_analyzer(context, AnalyzerCommand::ToggleLapTimer);
         }
+        UiCommand::RecordFrameMark { frame } => {
+            log::info!("worker command: record frame mark at global frame {frame}");
+            match append_frame_mark(&context.frame_marks_path, frame) {
+                Ok(()) => {
+                    // Refresh the mark list immediately so the HUD can show this
+                    // frame's note without waiting for the periodic reload.
+                    let marks = load_pause_marks(&context.frame_marks_path);
+                    state.update_ui(|ui, _| {
+                        ui.mark_str = frame.to_string();
+                        ui.pause_marks = marks;
+                        ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+                    });
+                }
+                Err(error) => log::error!(
+                    "failed to write frame mark to '{}': {error}",
+                    context.frame_marks_path.display()
+                ),
+            }
+        }
+        UiCommand::TogglePauseMode { enabled } => {
+            log::info!("worker command: toggle pause mode -> {enabled}");
+            // Keep the marks loaded even when pause mode is off: the HUD also uses
+            // them to show the note of the frame that was just reached.
+            let marks = load_pause_marks(&context.frame_marks_path);
+            let count = marks.len();
+            state.update_ui(|ui, _| {
+                ui.pause_mode = enabled;
+                ui.pause_active = false;
+                ui.pause_text.clear();
+                ui.pause_marks = marks;
+                ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+            });
+            if enabled {
+                log::info!(
+                    "pause mode armed with {count} marks from '{}'",
+                    context.frame_marks_path.display()
+                );
+            }
+        }
+        UiCommand::SelectAxis { name } => {
+            let trimmed = name.trim();
+            let axis = if trimmed.is_empty() {
+                DEFAULT_AXIS_NAME.to_string()
+            } else {
+                trimmed.to_string()
+            };
+            log::info!("worker command: select axis '{axis}'");
+            context.frame_marks_path = context.axes_dir.join(format!("{axis}.txt"));
+            context.config.active_axis = Some(axis.clone());
+            persist_config(context, "select axis");
+            let marks = load_pause_marks(&context.frame_marks_path);
+            state.update_ui(|ui, _| {
+                ui.active_axis_name = Some(axis);
+                ui.pause_marks = marks;
+                ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+            });
+        }
+        UiCommand::SetPauseLead { frames } => {
+            log::info!("worker command: set pause lead frames to {frames}");
+            context.config.pause_lead_frames = Some(frames);
+            persist_config(context, "set pause lead frames");
+            state.update_ui(|ui, _| ui.pause_lead_frames = frames);
+        }
         UiCommand::SetOverlayScale(mult) => {
-            let pct = (mult * 100.0).round().clamp(50.0, 400.0) as u16;
+            let pct = (mult * 100.0).round().clamp(50.0, 200.0) as u16;
+            let mult = f32::from(pct) / 100.0;
             log::info!("worker command: set overlay scale to {}%", pct);
             context.config.overlay_scale = Some(mult);
             persist_config(context, "set overlay scale");
             state.update_ui(|ui, _| ui.overlay_scale_pct = pct);
+        }
+        UiCommand::SetHotkeys {
+            record_frame,
+            pause_mode,
+            lap,
+        } => {
+            log::info!(
+                "worker command: set hotkeys (record='{record_frame}', pause='{pause_mode}', lap='{lap}')"
+            );
+            context.config.hotkey_record_frame = Some(record_frame.clone());
+            context.config.hotkey_pause_mode = Some(pause_mode.clone());
+            context.config.hotkey_lap = Some(lap.clone());
+            persist_config(context, "set hotkeys");
+            state.update_ui(|ui, _| {
+                ui.hotkey_record_frame = record_frame;
+                ui.hotkey_pause_mode = pause_mode;
+                ui.hotkey_lap = lap;
+                ui.appearance_generation = ui.appearance_generation.wrapping_add(1);
+            });
         }
         UiCommand::SaveOverlayPlacement { x, y } => {
             log::debug!("worker command: save overlay placement x={x}, y={y}");
@@ -779,6 +974,133 @@ fn send_analyzer(context: &WorkerContext, cmd: AnalyzerCommand) {
     if let Some(tx) = &context.analyzer_command_tx {
         let _ = tx.send(cmd);
     }
+}
+
+fn reload_pause_marks(state: &SharedAppState, context: &WorkerContext) {
+    // Reload regardless of pause mode: the HUD shows a mark's note whenever the
+    // timer sits exactly on that frame, which must work with pause mode off too.
+    let snapshot = state.snapshot();
+    let marks = load_pause_marks(&context.frame_marks_path);
+    if snapshot.ui.pause_marks == marks {
+        return;
+    }
+    log::info!(
+        "frame mark document changed; loaded {} marks from '{}'",
+        marks.len(),
+        context.frame_marks_path.display()
+    );
+    state.update_ui(|ui, _| {
+        ui.pause_marks = marks;
+        ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+    });
+}
+
+fn migrate_legacy_frame_marks(dir: &Path, legacy: &Path) {
+    if !legacy.exists() {
+        return;
+    }
+    let has_axes = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                entry.path().extension().and_then(|ext| ext.to_str()) == Some("txt")
+            })
+        })
+        .unwrap_or(false);
+    if has_axes {
+        return;
+    }
+    let target = dir.join(format!("{DEFAULT_AXIS_NAME}.txt"));
+    if std::fs::rename(legacy, &target).is_ok() {
+        log::info!("migrated legacy frame marks to '{}'", target.display());
+    }
+}
+
+fn parse_mark_line(line: &str) -> Option<PauseMark> {
+    let line = line.trim();
+    let rest = line.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let frame = rest[..close].trim().parse::<u32>().ok()?;
+    Some(PauseMark {
+        frame,
+        text: rest[close + 1..].trim().to_string(),
+    })
+}
+
+fn append_frame_mark(path: &Path, frame: u64) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut leading: Vec<String> = Vec::new();
+    let mut groups: Vec<(PauseMark, Vec<String>)> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match parse_mark_line(trimmed) {
+            Some(mark) => groups.push((mark, Vec::new())),
+            None => match groups.last_mut() {
+                Some((_, others)) => others.push(trimmed.to_string()),
+                None => leading.push(trimmed.to_string()),
+            },
+        }
+    }
+
+    let frame = u32::try_from(frame).unwrap_or(u32::MAX);
+    let mut merged: Vec<(PauseMark, Vec<String>)> = Vec::new();
+    for (mark, others) in groups {
+        match merged
+            .iter_mut()
+            .find(|(kept, _)| kept.frame == mark.frame)
+        {
+            Some((kept, kept_others)) => {
+                if kept.text.is_empty() && !mark.text.is_empty() {
+                    kept.text = mark.text;
+                }
+                kept_others.extend(others);
+            }
+            None => merged.push((mark, others)),
+        }
+    }
+    if !merged.iter().any(|(mark, _)| mark.frame == frame) {
+        merged.push((
+            PauseMark {
+                frame,
+                text: String::new(),
+            },
+            Vec::new(),
+        ));
+    }
+    merged.sort_by_key(|(mark, _)| mark.frame);
+
+    let mut output = String::new();
+    for line in leading {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    for (mark, others) in &merged {
+        output.push_str(&format!("[{}]{}\n", mark.frame, mark.text));
+        for line in others {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    std::fs::write(path, output)
+}
+
+fn load_pause_marks(path: &Path) -> Vec<PauseMark> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        log::warn!("frame mark document not readable: '{}'", path.display());
+        return Vec::new();
+    };
+
+    let mut marks: Vec<PauseMark> = content.lines().filter_map(parse_mark_line).collect();
+    marks.sort_by_key(|mark| mark.frame);
+    marks
 }
 
 fn run_calibration(state: &SharedAppState, context: &mut WorkerContext) -> Result<(), String> {
@@ -903,13 +1225,17 @@ fn publish_current_state(state: &SharedAppState, context: &WorkerContext) {
 }
 
 fn publish_running_state(state: &SharedAppState, context: &WorkerContext) {
+    state.set_precalibration_active(false);
     let active_profile = context.active_profile.clone();
+    // No axis label unless a name was explicitly chosen/renamed (see startup).
+    let axis_name = context.config.active_axis.clone();
     state.update_ui(|ui, api| {
         ui.mode = OverlayMode::Running;
         ui.message.clear();
         ui.progress_percent = 0.0;
         ui.display_mode = context.display_mode;
         ui.active_profile = active_profile.clone();
+        ui.active_axis_name = axis_name.clone();
         ui.profiles = context.profiles.list(active_profile.as_deref());
         ui.cursor_blocked = false;
         api.active_profile = active_profile.as_deref().map(calibration_basename);
@@ -917,11 +1243,14 @@ fn publish_running_state(state: &SharedAppState, context: &WorkerContext) {
 }
 
 fn publish_idle(state: &SharedAppState, context: &WorkerContext) {
+    state.set_precalibration_active(false);
+    let axis_name = context.config.active_axis.clone();
     state.update_ui(|ui, api| {
         ui.mode = OverlayMode::Idle;
         ui.message.clear();
         ui.progress_percent = 0.0;
         ui.display_mode = context.display_mode;
+        ui.active_axis_name = axis_name.clone();
         ui.display_frame = "--".to_string();
         ui.display_total = "/--".to_string();
         ui.time_str = "00:00:00".to_string();
@@ -952,6 +1281,19 @@ fn publish_error(state: &SharedAppState, context: &WorkerContext, error: String)
         api.is_running = false;
         api.current_frame = None;
         api.clear_frame_metadata();
+    });
+}
+
+/// Any timer adjustment implicitly turns the automatic pause off: adjusting the
+/// timer by hand and being paused by a mark at the same moment is never wanted.
+fn disable_pause_mode(state: &SharedAppState) {
+    state.update_ui(|ui, _| {
+        if ui.pause_mode || ui.pause_active {
+            ui.pause_mode = false;
+            ui.pause_active = false;
+            ui.pause_text.clear();
+            ui.pause_marks_generation = ui.pause_marks_generation.wrapping_add(1);
+        }
     });
 }
 
@@ -1010,26 +1352,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_notice_enters_snapshot_and_notifies_overlay() {
+    fn update_notice_defaults_to_none() {
+        // The update check was removed; the snapshot field is only a placeholder
+        // now, so assert it stays empty.
         let state = SharedAppState::default();
-        let wake_count = Arc::new(AtomicUsize::new(0));
-        state.set_overlay_waker(Some(Arc::new({
-            let wake_count = Arc::clone(&wake_count);
-            move || {
-                wake_count.fetch_add(1, Ordering::SeqCst);
-            }
-        })));
-        let notice = UpdateNotice {
-            version: "2.3.0".to_string(),
-            release_title: "Ruler 2.3.0".to_string(),
-            html_url: "https://github.com/ZeroAd-06/ArknightsCostBarRuler/releases/tag/20260627"
-                .to_string(),
-            download_url: None,
-        };
-
-        state.set_update_notice(Some(notice.clone()));
-
-        assert_eq!(state.snapshot().ui.update_notice, Some(notice));
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.snapshot().ui.update_notice, None);
     }
 }

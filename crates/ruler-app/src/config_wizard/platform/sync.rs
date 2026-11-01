@@ -18,6 +18,13 @@ pub(super) const WIZARD_LOGICAL_H: f32 = 443.0;
 // (sized for the dropdown-open type list / the 3-field MuMu-LDPlayer case).
 const WIZARD_DEBUG_RECORDING_H: f32 = 150.0;
 const WIZARD_DEBUG_MANUAL_H: f32 = 300.0;
+// Height of the "adb unavailable" banner, which the layout inserts above the
+// target list. It is a fixed-height block in `wizard.slint`, so the host has to
+// account for it when sizing the window — otherwise the VerticalLayout squeezes
+// every section and the options look truncated.
+const WIZARD_ADB_BANNER_H: f32 = 56.0;
+// Root layout spacing (see `VerticalLayout { spacing: 10px }` in wizard.slint).
+const WIZARD_ROW_SPACING: f32 = 10.0;
 
 pub(super) fn wizard_logical_height(debug_expanded: bool, manual_mode: bool) -> f32 {
     if !debug_expanded {
@@ -26,6 +33,15 @@ pub(super) fn wizard_logical_height(debug_expanded: bool, manual_mode: bool) -> 
         WIZARD_LOGICAL_H + WIZARD_DEBUG_MANUAL_H
     } else {
         WIZARD_LOGICAL_H + WIZARD_DEBUG_RECORDING_H
+    }
+}
+
+/// Extra logical height taken by the "adb unavailable" banner.
+pub(super) fn wizard_adb_banner_height(visible: bool) -> f32 {
+    if visible {
+        WIZARD_ADB_BANNER_H + WIZARD_ROW_SPACING
+    } else {
+        0.0
     }
 }
 

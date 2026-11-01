@@ -23,7 +23,6 @@ use ruler_core::{
 
 use crate::{
     debug_recorder::DebugRecorder,
-    telemetry::RunTelemetryStats,
     ui_state::{
         format_time_from_frames, ApiFrameRecord, ApiStateSnapshot, FrameDisplayMode, OverlayMode,
         ResetKind,
@@ -80,7 +79,6 @@ pub struct AnalyzerConfig {
     pub calibration_path: Option<std::path::PathBuf>,
     /// Pipeline info (for window_info, used by the cursor guard).
     pub pipeline_info: PipelineInfo,
-    pub telemetry_stats: Arc<RunTelemetryStats>,
     /// Windows-only cursor guard. Detects when the in-game self-drawn
     /// cursor overlaps the cost bar so the frame is skipped.
     #[cfg(windows)]
@@ -136,7 +134,6 @@ impl AnalyzerConsumer {
             timer_reset_undo: TimerResetUndo::default(),
             debug_recorder,
             pipeline_info: config.pipeline_info,
-            telemetry_stats: config.telemetry_stats,
             calibrating: false,
         };
 
@@ -281,7 +278,6 @@ struct AnalyzerContext {
     timer_reset_undo: TimerResetUndo,
     debug_recorder: Option<DebugRecorder>,
     pipeline_info: PipelineInfo,
-    telemetry_stats: Arc<RunTelemetryStats>,
     calibrating: bool,
 }
 
@@ -343,7 +339,6 @@ fn analyze_and_publish(state: &SharedAppState, ctx: &mut AnalyzerContext, frame:
         }
     }
 
-    ctx.telemetry_stats.record_analyzed_frame();
     match ctx.analyzer.analyze_raw_buffer(
         frame.data.as_slice(),
         frame.width,
@@ -370,7 +365,6 @@ fn analyze_and_publish(state: &SharedAppState, ctx: &mut AnalyzerContext, frame:
             if auto_reset {
                 state.clear_api_frame_history();
                 ctx.last_recorded_frame_id = None;
-                ctx.telemetry_stats.record_action_restart();
             }
 
             ctx.last_total_frames = result.total_frames_in_cycle;
@@ -420,6 +414,11 @@ fn cursor_blocks_cost_bar(
 }
 
 fn publish_running(state: &SharedAppState, ctx: &AnalyzerContext, record: &ApiFrameRecord) {
+    // The worker owns the HUD while the PreCalibration screen is up: a frame that
+    // was already in flight must not flip the overlay back to Running.
+    if state.precalibration_active() {
+        return;
+    }
     let display_frame = ctx.display_mode.display_frame(record.current_frame);
     let display_total = if record.total_frames_in_cycle > 0 {
         display_total_with_cost_marker(
@@ -442,6 +441,7 @@ fn publish_running(state: &SharedAppState, ctx: &AnalyzerContext, record: &ApiFr
         ui.display_mode = ctx.display_mode;
         ui.display_frame = display_frame;
         ui.display_total = display_total;
+        ui.global_frame = ctx.last_elapsed_frames.max(0) as u64;
         ui.time_str = format_time_from_frames(ctx.last_elapsed_frames);
         ui.lap_frames = lap_frames;
         ui.can_undo_reset = can_undo_reset;
@@ -459,6 +459,9 @@ fn publish_cursor_blocked(
     frame: &PipelineFrame,
     battle_state: BattleState,
 ) {
+    if state.precalibration_active() {
+        return;
+    }
     let lap_frames = ctx
         .lap_start_frame
         .map(|start| ctx.last_elapsed_frames - start);
@@ -468,6 +471,7 @@ fn publish_cursor_blocked(
         ui.message.clear();
         ui.progress_percent = 0.0;
         ui.cursor_blocked = true;
+        ui.global_frame = ctx.last_elapsed_frames.max(0) as u64;
         ui.time_str = format_time_from_frames(ctx.last_elapsed_frames);
         ui.lap_frames = lap_frames;
         api.is_running = false;

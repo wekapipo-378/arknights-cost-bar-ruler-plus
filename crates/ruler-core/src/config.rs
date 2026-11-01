@@ -32,6 +32,10 @@ pub struct RulerConfig {
     #[serde(default)]
     pub active_calibration_profile: Option<String>,
     #[serde(default)]
+    pub active_axis: Option<String>,
+    #[serde(default)]
+    pub pause_lead_frames: Option<i32>,
+    #[serde(default)]
     pub frame_display_mode: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
@@ -47,6 +51,14 @@ pub struct RulerConfig {
     /// Overlay scale multiplier (1.0 == 100%, the height-aligned default).
     #[serde(default)]
     pub overlay_scale: Option<f32>,
+
+    // -- Global hotkeys (empty / missing == unbound) ------------------------
+    #[serde(default)]
+    pub hotkey_record_frame: Option<String>,
+    #[serde(default)]
+    pub hotkey_pause_mode: Option<String>,
+    #[serde(default)]
+    pub hotkey_lap: Option<String>,
     /// Arknights PC "UI比例缩放" value. 1.0 matches emulator layout, 0.0 uses
     /// 90% edge length.
     #[serde(default)]
@@ -294,6 +306,8 @@ mod tests {
             window_title: None,
             window_class: None,
             active_calibration_profile: None,
+            active_axis: None,
+            pause_lead_frames: None,
             frame_display_mode: None,
             language: None,
             auto_select_target: false,

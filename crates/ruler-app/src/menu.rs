@@ -16,10 +16,15 @@ pub mod win32 {
         },
     };
 
-    const ABOUT_PAGE_URL: &str = "https://github.com/ZeroAd-06/ArknightsCostBarRuler";
+    const ABOUT_PAGE_URL: &str = "https://github.com/wekapipo-378/arknights-cost-bar-ruler-plus";
+    const BILIBILI_URL: &str = "https://space.bilibili.com/440985091";
 
     pub unsafe fn open_about_page() {
         open_url(ABOUT_PAGE_URL);
+    }
+
+    pub unsafe fn open_bilibili_page() {
+        open_url(BILIBILI_URL);
     }
 
     pub unsafe fn open_url(url: &str) {

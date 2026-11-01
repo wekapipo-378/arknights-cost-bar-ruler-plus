@@ -3,6 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const FRAME_MARKS_FILENAME: &str = "frame_marks.txt";
+const AXES_DIRNAME: &str = "axes";
+
 #[derive(Clone, Debug)]
 pub struct ResourceLocator {
     project_root: PathBuf,
@@ -49,6 +52,22 @@ impl ResourceLocator {
     #[must_use]
     pub fn config_path(&self) -> PathBuf {
         self.config_path.clone()
+    }
+
+    #[must_use]
+    pub fn frame_marks_path(&self) -> PathBuf {
+        match path_parent(&self.config_path) {
+            Some(parent) => parent.join(FRAME_MARKS_FILENAME),
+            None => self.data_dir.join(FRAME_MARKS_FILENAME),
+        }
+    }
+
+    #[must_use]
+    pub fn axes_dir(&self) -> PathBuf {
+        match path_parent(&self.config_path) {
+            Some(parent) => parent.join(AXES_DIRNAME),
+            None => self.data_dir.join(AXES_DIRNAME),
+        }
     }
 
     #[must_use]

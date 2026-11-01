@@ -9,6 +9,21 @@ use crate::{ui_state::UpdateNotice, worker::SharedAppState};
 const UPDATE_URL: &str = "https://arkruler-telemetry.z060606060606.online/update";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// Ensures `config.uuid` exists and is persisted.
+///
+/// The UUID only makes update-check requests distinguishable; it is **not**
+/// usage telemetry (that feature was removed).
+pub fn ensure_config_uuid(config: &mut ruler_core::RulerConfig, config_path: &std::path::Path) {
+    if config.uuid.as_deref().map(str::is_empty).unwrap_or(true) {
+        config.uuid = Some(uuid::Uuid::new_v4().to_string());
+        if let Err(error) = config.save_to_path(config_path) {
+            log::warn!("failed to persist generated uuid: {error}");
+        } else {
+            log::info!("generated anonymous install uuid");
+        }
+    }
+}
+
 #[derive(Debug)]
 enum UpdateCheckError {
     Client(reqwest::Error),

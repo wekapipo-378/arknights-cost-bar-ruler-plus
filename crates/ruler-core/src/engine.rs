@@ -56,6 +56,11 @@ pub struct Analyzer {
     /// was already late in its cycle, so a momentary false width drop cannot be
     /// read as "advanced most of a cycle".
     last_accepted_phase: Option<f64>,
+    /// Set by [`Analyzer::reset_timer`]: the next accepted frame only re-aligns the
+    /// bar phase instead of advancing the counter. Without this the re-created
+    /// timing model "catches up" on its first frame and a fresh reset showed a
+    /// jump of several frames (e.g. 00:00:08 instead of 00:00:00).
+    reset_pending: bool,
     last_cost_is_negative: bool,
     last_known_cycle_total_frames: i32,
     /// Consecutive analysed frames spent out of an active battle. A genuine
@@ -70,6 +75,16 @@ pub struct Analyzer {
     battle_begin_reset_armed: bool,
     elapsed_frames: i32,
     last_reported_battle_state: Option<BattleState>,
+
+    // ========== 新增：游戏逻辑帧标记系统 ==========
+    /// 标记列表：(逻辑帧号, 备注文本)
+    markers: Vec<(i32, String)>,
+    /// 标记暂停模式开关
+    markers_pause_enabled: bool,
+    /// 上一次触发的逻辑帧号，防止同一帧重复暂停
+    last_triggered_frame: Option<i32>,
+    /// 当前命中的标记文本，供上层UI/热键模块读取
+    pub current_marker_text: Option<String>,
 }
 
 /// Minimum consecutive out-of-battle frames before a `BeforeOrAfterBattle` frame
@@ -102,12 +117,19 @@ impl Analyzer {
             ui_scaler: roi::DEFAULT_UI_SCALER,
             fp24: None,
             last_accepted_phase: None,
+            reset_pending: false,
             last_cost_is_negative: false,
             last_known_cycle_total_frames: 0,
             out_of_battle_frames: 0,
             battle_begin_reset_armed: true,
             elapsed_frames: 0,
             last_reported_battle_state: None,
+
+            // 新增初始化
+            markers: Vec::new(),
+            markers_pause_enabled: false,
+            last_triggered_frame: None,
+            current_marker_text: None,
         }
     }
 
@@ -194,6 +216,12 @@ impl Analyzer {
         self.last_known_cycle_total_frames = 0;
         self.last_cost_is_negative = false;
         self.last_accepted_phase = None;
+        self.reset_pending = true;
+
+        // 重置标记触发状态，避免跨战斗串号
+        self.last_triggered_frame = None;
+        self.current_marker_text = None;
+
         if let Some(required) = self.required() {
             self.fp24 = Some(Fp24CostTiming::new(required));
         }
@@ -209,6 +237,73 @@ impl Analyzer {
     /// single `required` value (X.5 alternation and the boundary cycle are
     /// intrinsic), so there is no multi-profile index to select.
     pub fn set_profile_index(&mut self, _index: usize) {}
+
+    // ========== 新增：标记系统公开方法 ==========
+    /// 记录当前逻辑帧为一个标记，附带备注文本
+    pub fn add_current_marker(&mut self, text: String) {
+        let frame = self.elapsed_frames;
+        self.markers.push((frame, text.clone()));
+        log::info!("添加逻辑帧标记: [{}]{}", frame, text);
+    }
+
+    /// 开关标记暂停模式
+    pub fn set_markers_pause_enabled(&mut self, enabled: bool) {
+        self.markers_pause_enabled = enabled;
+        self.last_triggered_frame = None;
+        if !enabled {
+            self.current_marker_text = None;
+        }
+        log::info!("标记暂停模式: {}", if enabled { "开启" } else { "关闭" });
+    }
+
+    /// 获取当前标记暂停模式状态
+    pub fn markers_pause_enabled(&self) -> bool {
+        self.markers_pause_enabled
+    }
+
+    /// 把所有标记写入文件，格式 [帧号]文本
+    pub fn save_markers_to_file(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        for (frame, text) in &self.markers {
+            writeln!(file, "[{}]{}", frame, text).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// 从文件读取标记列表，格式 [帧号]文本
+    pub fn load_markers_from_file(&mut self, path: &Path) -> Result<(), String> {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let reader = std::io::BufReader::new(file);
+        let mut new_markers = Vec::new();
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if !line.starts_with('[') { continue; }
+            if let Some(bracket_end) = line.find(']') {
+                let num_str = &line[1..bracket_end];
+                if let Ok(frame) = num_str.parse::<i32>() {
+                    let text = line[bracket_end+1..].to_string();
+                    new_markers.push((frame, text));
+                }
+            }
+        }
+
+        self.markers = new_markers;
+        self.last_triggered_frame = None;
+        log::info!("加载了 {} 个逻辑帧标记", self.markers.len());
+        Ok(())
+    }
+
+    /// 清空所有标记
+    pub fn clear_markers(&mut self) {
+        self.markers.clear();
+        self.last_triggered_frame = None;
+        self.current_marker_text = None;
+    }
 
     fn required(&self) -> Option<Fp24> {
         self.calibration.as_ref().map(|cal| cal.required())
@@ -328,9 +423,30 @@ impl Analyzer {
 
         // Commit the resync.
         self.fp24 = Some(outcome.timing);
-        self.elapsed_frames = self.elapsed_frames.saturating_add(outcome.advanced_frames);
+        // The first accepted frame after a reset only re-aligns the phase: the
+        // model was re-created from scratch, so its step is "distance from the
+        // cycle start", not elapsed time.
+        let advanced = if self.reset_pending {
+            self.reset_pending = false;
+            0
+        } else {
+            outcome.advanced_frames
+        };
+        self.elapsed_frames = self.elapsed_frames.saturating_add(advanced);
         self.last_accepted_phase = Some(outcome.phase);
         self.last_cost_is_negative = neg;
+
+        // ========== 新增：逻辑帧标记命中检测 ==========
+        if self.markers_pause_enabled {
+            let current_frame = self.elapsed_frames;
+            if self.last_triggered_frame != Some(current_frame) {
+                if let Some((_, text)) = self.markers.iter().find(|(f, _)| *f == current_frame) {
+                    self.last_triggered_frame = Some(current_frame);
+                    self.current_marker_text = Some(text.clone());
+                    log::info!("[标记命中] 逻辑帧{}: {}", current_frame, text);
+                }
+            }
+        }
 
         let frames_since_cycle_start = outcome.timing.frames_since_cycle_start();
         let frames_until_next_cost = outcome.timing.frames_until_next_cost(speed);

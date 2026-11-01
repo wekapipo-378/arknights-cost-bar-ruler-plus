@@ -26,7 +26,10 @@ use super::geometry::{
     advance_displayed_progress, compute_reset_phase, initial_geometry,
     outer_area_should_pass_through_at,
 };
-use super::{menu, LOGICAL_H, LOGICAL_W, OVERLAY_TIMER_INTERVAL_MS};
+use super::{
+    axes, menu, LOGICAL_H, LOGICAL_PANEL_H, LOGICAL_TOOLBAR_H, LOGICAL_TOOLBAR_RIGHT_PAD,
+    LOGICAL_TOOLBAR_TOP_GAP, LOGICAL_TOOLBAR_W, LOGICAL_W, OVERLAY_TIMER_INTERVAL_MS,
+};
 use crate::overlay::OverlayError;
 use crate::{
     commands::UiCommand,
@@ -49,17 +52,26 @@ use windows::{
         UI::{
             Controls::WM_MOUSELEAVE,
             Input::KeyboardAndMouse::{
-                ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+                keybd_event, RegisterHotKey, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent,
+                UnregisterHotKey, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOD_ALT, MOD_CONTROL,
+                MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_MENU,
             },
             Shell::NOTIFYICONDATAW,
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-                GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW,
-                PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+                CreateWindowExW, BringWindowToTop, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+                IsDialogMessageW, IsIconic, LoadCursorW, PostMessageW, PostQuitMessage,
+                RegisterClassW, SetForegroundWindow, SetTimer,
+                SetWindowLongPtrW, SetWindowPos,
                 ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-                HICON, HMENU, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
+                SWP_NOZORDER, SW_SHOW,
+                SW_RESTORE,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY,
+                WM_LBUTTONDOWN, WM_LBUTTONUP,
                 WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+                WM_HOTKEY,
                 WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
             },
         },
@@ -70,6 +82,8 @@ const OVERLAY_TIMER_ID: usize = 1;
 const WM_OVERLAY_WAKE: u32 = WM_APP + 2;
 const WM_TRAYICON: u32 = WM_APP + 1;
 const HTTRANSPARENT_RESULT: isize = -1;
+const PAUSE_MIN_SHOW_DURATION: std::time::Duration = std::time::Duration::from_millis(50);
+const TOPMOST_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// In-flight reset cover animation. `kind` selects the label text.
 #[derive(Clone, Copy)]
@@ -91,7 +105,7 @@ pub(super) struct WindowState {
     buf_w: usize,
     buf_h: usize,
     pub(super) scale: f32,
-    base_scale: f32,
+    pub(super) base_scale: f32,
     scale_mult: f32,
     displayed_progress: f32,
     last_mode: OverlayMode,
@@ -106,6 +120,10 @@ pub(super) struct WindowState {
     tray_icon: Option<HICON>,
     // guards against a re-entrant popup (e.g. tray click while menu is open)
     pub(super) menu_open: bool,
+    pub(super) axes_open: bool,
+    pub(super) menu_hwnd: isize,
+    pub(super) menu_alive: bool,
+    pub(super) axes_hwnd: isize,
     // pointer / drag bookkeeping
     mouse_down: bool,
     moved: bool,
@@ -113,6 +131,14 @@ pub(super) struct WindowState {
     drag_origin: POINT,
     window_origin: POINT,
     tracking_leave: bool,
+    last_topmost_at: Instant,
+    pause_was_enabled: bool,
+    pause_shown_at: Instant,
+    seen_marks_generation: u32,
+    last_global_frame: u64,
+    /// Currently registered global hotkeys (same order as the config fields).
+    hotkeys: [String; 3],
+    hotkeys_generation: u32,
 }
 
 impl Drop for WindowState {
@@ -167,7 +193,7 @@ pub(crate) fn run(
         let instance = GetModuleHandleW(PCWSTR::null())
             .map_err(|error| OverlayError::new(format!("GetModuleHandleW failed: {error}")))?;
         let class_name = wide("RulerOverlayWindowClass");
-        let title = wide("Arknights Cost Bar Ruler");
+        let title = wide("Cost Bar Ruler Plus");
 
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -186,7 +212,7 @@ pub(crate) fn run(
         let (mem_dc, dib, bits) = create_dib(width, height)
             .ok_or_else(|| OverlayError::new("failed to create framebuffer DIB"))?;
 
-        let window_state = Box::new(WindowState {
+        let state_box = Box::new(WindowState {
             hud,
             window: window.clone(),
             state: Arc::clone(&shared_state),
@@ -208,14 +234,25 @@ pub(crate) fn run(
             nid: NOTIFYICONDATAW::default(),
             tray_icon: None,
             menu_open: false,
+            axes_open: false,
+            menu_hwnd: 0,
+            menu_alive: false,
+            axes_hwnd: 0,
             mouse_down: false,
             moved: false,
             drag_on_bg,
             drag_origin: POINT::default(),
             window_origin: POINT::default(),
             tracking_leave: false,
+            last_topmost_at: Instant::now(),
+            pause_was_enabled: false,
+            pause_shown_at: Instant::now(),
+            seen_marks_generation: 0,
+            last_global_frame: 0,
+            hotkeys: [String::new(), String::new(), String::new()],
+            hotkeys_generation: u32::MAX,
         });
-        let state_ptr = Box::into_raw(window_state);
+        let state_ptr = Box::into_raw(state_box);
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0),
@@ -275,6 +312,17 @@ pub(crate) fn run(
             if result == 0 {
                 break;
             }
+            // The settings window is modeless (it lives on this loop), so its
+            // dialog keyboard handling — Tab between controls, Enter on the
+            // focused button, Esc as 取消 — has to run here.
+            let settings_hwnd = window_state(hwnd)
+                .map(|state| state.menu_hwnd)
+                .unwrap_or(0);
+            if settings_hwnd != 0
+                && IsDialogMessageW(HWND(settings_hwnd as *mut _), &message).as_bool()
+            {
+                continue;
+            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -290,7 +338,7 @@ fn wire_callbacks(
     state: &Arc<SharedAppState>,
     command_tx: &Sender<UiCommand>,
     drag_on_bg: &Rc<Cell<bool>>,
-    _hwnd_cell: &Rc<Cell<isize>>,
+    hwnd_cell: &Rc<Cell<isize>>,
 ) {
     hud.on_start_clicked({
         let tx = command_tx.clone();
@@ -298,38 +346,52 @@ fn wire_callbacks(
             let _ = tx.send(UiCommand::StartCalibration);
         }
     });
-    hud.on_reset_clicked({
+    hud.on_close_clicked({
         let tx = command_tx.clone();
+        let state = Arc::clone(state);
         move || {
-            let _ = tx.send(UiCommand::ResetTimer);
+            state.request_cancel_calibration();
+            let _ = tx.send(UiCommand::Exit);
         }
     });
-    hud.on_undo_reset_clicked({
-        let tx = command_tx.clone();
+    hud.on_settings_clicked({
+        let hwnd_cell = Rc::clone(hwnd_cell);
         move || {
-            let _ = tx.send(UiCommand::UndoResetTimer);
+            let raw = hwnd_cell.get();
+            if raw != 0 {
+                unsafe { menu::show_menu(HWND(raw as *mut _)) };
+            }
         }
     });
     hud.on_lap_clicked({
         let tx = command_tx.clone();
+        let state = Arc::clone(state);
         move || {
+            focus_game_window(&state);
             let _ = tx.send(UiCommand::ToggleLapTimer);
         }
     });
-    hud.on_back_cycle({
+    hud.on_record_frame_clicked({
         let tx = command_tx.clone();
         let state = Arc::clone(state);
         move || {
-            let frames = state.snapshot().ui.total_frames_in_cycle;
-            let _ = tx.send(UiCommand::AdjustTimer { frames: -frames });
+            let frame = state.snapshot().ui.global_frame;
+            focus_game_window(&state);
+            let _ = tx.send(UiCommand::RecordFrameMark { frame });
         }
     });
-    hud.on_fwd_cycle({
+    hud.on_pause_mode_clicked({
         let tx = command_tx.clone();
         let state = Arc::clone(state);
         move || {
-            let frames = state.snapshot().ui.total_frames_in_cycle;
-            let _ = tx.send(UiCommand::AdjustTimer { frames });
+            let ui = state.snapshot().ui;
+            let enabled = if ui.pause_active {
+                true
+            } else {
+                !ui.pause_mode
+            };
+            focus_game_window(&state);
+            let _ = tx.send(UiCommand::TogglePauseMode { enabled });
         }
     });
     hud.on_open_update({
@@ -393,10 +455,10 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_OVERLAY_WAKE => {
-            // Worker notifications can arrive at ~1 kHz; rendering is
-            // throttled to the 16 ms timer, so only act on a prompt exit.
             if should_exit(hwnd) {
                 let _ = DestroyWindow(hwnd);
+            } else {
+                pause_check(hwnd);
             }
             LRESULT(0)
         }
@@ -422,22 +484,103 @@ unsafe extern "system" fn window_proc(
             handle_left_up(hwnd);
             LRESULT(0)
         }
+        WM_HOTKEY => {
+            let id = wparam.0 as i32;
+            if let Some(state) = window_state(hwnd) {
+                let snapshot = state.state.snapshot();
+                let command = match id {
+                    1 => Some(UiCommand::RecordFrameMark {
+                        frame: snapshot.ui.global_frame,
+                    }),
+                    2 => Some(UiCommand::TogglePauseMode {
+                        enabled: !snapshot.ui.pause_mode,
+                    }),
+                    3 => Some(UiCommand::ToggleLapTimer),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    // Frame/lap actions must land in the game, like the buttons do.
+                    if id == 1 || id == 3 {
+                        focus_game_window(&state.state);
+                    }
+                    let _ = state.command_tx.send(command);
+                }
+            }
+            LRESULT(0)
+        }
         WM_RBUTTONUP => {
-            menu::show_menu(hwnd);
+            let axes_open = window_state(hwnd)
+                .map(|state| {
+                    state.axes_hwnd != 0
+                        && unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(
+                                state.axes_hwnd as *mut _,
+                            ))
+                            .as_bool()
+                        }
+                })
+                .unwrap_or(false);
+            let running = window_state(hwnd)
+                .map(|state| state.state.snapshot().ui.mode == OverlayMode::Running)
+                .unwrap_or(false);
+            // Without an active calibration profile there is nothing the axis
+            // window could show, so a right click always goes to the settings
+            // window (which opens on the calibration page) — even when the axis
+            // window happens to be open.
+            let no_active_profile = window_state(hwnd)
+                .map(|state| state.state.snapshot().ui.active_profile.is_none())
+                .unwrap_or(true);
+            if no_active_profile {
+                menu::show_menu(hwnd);
+            } else if axes_open {
+                if let Some(state) = window_state_mut(hwnd) {
+                    let target = state.axes_hwnd;
+                    state.axes_hwnd = 0;
+                    state.axes_open = false;
+                    // Close through the window message only; the window's own
+                    // tick loop reacts to `WM_CLOSE_AXES` and exits cleanly.
+                    if target != 0 {
+                        let _ = PostMessageW(
+                            HWND(target as *mut _),
+                            axes::WM_CLOSE_AXES,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            } else if running {
+                axes::show_axes(hwnd);
+            } else {
+                menu::show_menu(hwnd);
+            }
             LRESULT(0)
         }
         WM_TRAYICON => {
             // Shell forwards the mouse action in the low word of lparam.
             if lparam.0 as u32 == WM_RBUTTONUP {
-                if let Some(state) = window_state_mut(hwnd) {
-                    let snapshot = state.state.snapshot();
-                    let tip = match snapshot.ui.mode {
-                        OverlayMode::Running => "明日方舟费用条尺子".to_string(),
-                        _ => snapshot.ui.message.clone(),
-                    };
-                    tray::win32::update_tooltip(&mut state.nid, &tip);
+                let command = unsafe { tray::win32::show_context_menu(hwnd) };
+                if command != 0 {
+                    let mut exit = false;
+                    let mut open_menu = false;
+                    let mut open_axes = false;
+                    match command {
+                        1 => open_menu = true,
+                        2 => open_axes = true,
+                        3 => exit = true,
+                        _ => {}
+                    }
+                    if let Some(state) = window_state(hwnd) {
+                        if exit {
+                            state.state.request_cancel_calibration();
+                            let _ = state.command_tx.send(UiCommand::Exit);
+                        }
+                    }
+                    if open_menu {
+                        menu::show_menu(hwnd);
+                    } else if open_axes {
+                        axes::show_axes(hwnd);
+                    }
                 }
-                menu::show_menu(hwnd);
             }
             LRESULT(0)
         }
@@ -456,6 +599,17 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+unsafe fn pause_check(hwnd: HWND) {
+    let Some(state) = window_state_mut(hwnd) else {
+        return;
+    };
+    let snapshot = state.state.snapshot();
+    if !snapshot.ui.pause_mode && !snapshot.ui.pause_active {
+        return;
+    }
+    advance_pause_mode(state, &snapshot.ui, snapshot.api.battle_state.as_deref());
+}
+
 unsafe fn tick(hwnd: HWND) {
     slint::platform::update_timers_and_animations();
     let Some(state) = window_state_mut(hwnd) else {
@@ -463,13 +617,31 @@ unsafe fn tick(hwnd: HWND) {
     };
     let snapshot = state.state.snapshot();
 
+    if !state.menu_open
+        && !state.axes_open
+        && state.last_topmost_at.elapsed() >= TOPMOST_REASSERT_INTERVAL
+    {
+        state.last_topmost_at = Instant::now();
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+
     let want_mult = f32::from(snapshot.ui.overlay_scale_pct) / 100.0;
     if (want_mult - state.scale_mult).abs() > 0.001 {
         apply_scale(hwnd, state, want_mult);
     }
 
     sync_properties(state, &snapshot.ui);
+    apply_hotkeys(hwnd, state, &snapshot.ui);
     advance_reset_anim(state, &snapshot.ui);
+    advance_pause_mode(state, &snapshot.ui, snapshot.api.battle_state.as_deref());
 
     let w = state.buf_w;
     let h = state.buf_h;
@@ -554,6 +726,31 @@ fn sync_properties(state: &mut WindowState, ui: &crate::ui_state::UiSnapshot) {
         hud.set_cursor_warning_text(state.i18n.tr("overlay.cursor.blocked").into());
         hud.set_update_available(ui.update_notice.is_some());
         hud.set_update_text(state.i18n.tr("update.badge.short").into());
+        hud.set_mark_str(mark_text(ui).into());
+        hud.set_next_mark_str(next_mark_text(ui).into());
+        hud.set_axis_str(
+            ui.active_axis_name
+                .as_deref()
+                .unwrap_or_default()
+                .into(),
+        );
+        hud.set_pause_mode(ui.pause_mode);
+        hud.set_pause_lead_str(
+            if ui.pause_mode {
+                // A positive lead pauses *before* the mark (shown as "-N"), a
+                // negative one after it ("+N"); 0 shows plainly as "0".
+                let frames = ui.pause_lead_frames as i64;
+                let text = match frames {
+                    0 => "0".to_string(),
+                    n if n > 0 => format!("-{n}"),
+                    n => format!("+{}", -n),
+                };
+                text
+            } else {
+                String::new()
+            }
+            .into(),
+        );
 
         let message = match ui.mode {
             OverlayMode::Idle => state.i18n.tr("overlay.msg.idle"),
@@ -565,6 +762,123 @@ fn sync_properties(state: &mut WindowState, ui: &crate::ui_state::UiSnapshot) {
     }
 
     state.last_mode = ui.mode.clone();
+}
+
+/// Amber line at the bottom-left of the HUD: the current frame plus the note of
+/// the mark that sits exactly on this frame.
+///
+/// The note only needs the *current* frame to match a mark; pause mode is
+/// irrelevant, so it also shows while the timer is running (it used to be gated
+/// by the mark list only being reloaded while pause mode was armed).
+fn mark_text(ui: &crate::ui_state::UiSnapshot) -> String {
+    let frame = ui.global_frame;
+    let note = ui
+        .pause_marks
+        .iter()
+        .find(|mark| u64::from(mark.frame) == frame)
+        .map(|mark| mark.text.trim())
+        .filter(|text| !text.is_empty());
+    match note {
+        Some(text) => format!("{frame}  {text}"),
+        None => frame.to_string(),
+    }
+}
+
+/// Amber label at the bottom-right: frame number of the next marked frame.
+fn next_mark_text(ui: &crate::ui_state::UiSnapshot) -> String {
+    let frame = ui.global_frame;
+    ui.pause_marks
+        .iter()
+        .map(|mark| u64::from(mark.frame))
+        .filter(|mark_frame| *mark_frame > frame)
+        .min()
+        .map(|next| next.to_string())
+        .unwrap_or_default()
+}
+
+/// "Ctrl+Shift+M" -> hotkey modifiers + virtual-key code.
+fn parse_hotkey(spec: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+    let text = spec.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut modifiers = 0u32;
+    let mut vk = None;
+    for part in text.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= MOD_CONTROL.0,
+            "shift" => modifiers |= MOD_SHIFT.0,
+            "alt" => modifiers |= MOD_ALT.0,
+            "win" | "meta" => modifiers |= MOD_WIN.0,
+            other => vk = vk_code(other),
+        }
+    }
+    vk.map(|vk| (HOT_KEY_MODIFIERS(modifiers | MOD_NOREPEAT.0), vk))
+}
+
+fn vk_code(name: &str) -> Option<u32> {
+    let upper = name.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    if bytes.len() == 1 {
+        let ch = bytes[0];
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() {
+            return Some(ch as u32);
+        }
+    }
+    if let Some(rest) = upper.strip_prefix('F') {
+        if let Ok(number) = rest.parse::<u32>() {
+            if (1..=24).contains(&number) {
+                return Some(0x70 + number - 1);
+            }
+        }
+    }
+    match upper.as_str() {
+        "SPACE" => Some(0x20),
+        "TAB" => Some(0x09),
+        "ENTER" | "RETURN" => Some(0x0D),
+        "ESC" | "ESCAPE" => Some(0x1B),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "LEFT" => Some(0x25),
+        "UP" => Some(0x26),
+        "RIGHT" => Some(0x27),
+        "DOWN" => Some(0x28),
+        _ => None,
+    }
+}
+
+/// (Re-)register the three global hotkeys whenever the bindings change.
+unsafe fn apply_hotkeys(hwnd: HWND, state: &mut WindowState, ui: &crate::ui_state::UiSnapshot) {
+    if state.hotkeys_generation == ui.appearance_generation {
+        return;
+    }
+    state.hotkeys_generation = ui.appearance_generation;
+    let wanted = [
+        ui.hotkey_record_frame.clone(),
+        ui.hotkey_pause_mode.clone(),
+        ui.hotkey_lap.clone(),
+    ];
+    if wanted == state.hotkeys {
+        return;
+    }
+    for id in 1..=3 {
+        let _ = UnregisterHotKey(hwnd, id);
+    }
+    state.hotkeys = wanted.clone();
+    for (index, spec) in wanted.iter().enumerate() {
+        let Some((modifiers, vk)) = parse_hotkey(spec) else {
+            continue;
+        };
+        let id = index as i32 + 1;
+        match RegisterHotKey(hwnd, id, modifiers, vk) {
+            Ok(()) => log::info!("hotkey {id} registered: {spec}"),
+            Err(error) => log::warn!("hotkey '{spec}' could not be registered: {error:?}"),
+        }
+    }
 }
 
 /// Detect new resets via `reset_pulse` and advance the cover animation.
@@ -603,6 +917,170 @@ fn advance_reset_anim(state: &mut WindowState, ui: &crate::ui_state::UiSnapshot)
     hud.set_reset_top(phase.top);
     hud.set_reset_text(state.i18n.tr(label_key).into());
     hud.set_reset_text_opacity(phase.text_opacity);
+}
+
+fn advance_pause_mode(
+    state: &mut WindowState,
+    ui: &crate::ui_state::UiSnapshot,
+    battle_state: Option<&str>,
+) {
+    let frame = ui.global_frame;
+    let previous = state.last_global_frame;
+    state.last_global_frame = frame;
+
+    // While the user is adjusting the timer in the settings dialog, no automatic
+    // pause may fire (it would steal focus and send keys mid-edit).
+    if state.state.auto_pause_suspended() {
+        return;
+    }
+
+    if !ui.pause_mode {
+        state.pause_was_enabled = false;
+        if ui.pause_active {
+            clear_pause_display(state);
+        }
+        return;
+    }
+
+    if !state.pause_was_enabled {
+        state.pause_was_enabled = true;
+        state.last_global_frame = frame;
+        return;
+    }
+
+    if ui.pause_marks_generation != state.seen_marks_generation {
+        state.seen_marks_generation = ui.pause_marks_generation;
+        state.last_global_frame = frame;
+        return;
+    }
+
+    if ui.pause_active {
+        release_pause_display(state, battle_state);
+        return;
+    }
+
+    let crossed = ui
+        .pause_marks
+        .iter()
+        .filter(|mark| {
+            // Positive lead pauses before the mark, negative after it.
+            let target = i64::from(mark.frame) - i64::from(ui.pause_lead_frames);
+            let target = target.max(0) as u64;
+            target > previous && target <= frame
+        })
+        .min_by_key(|mark| mark.frame);
+
+    let Some(mark) = crossed else {
+        return;
+    };
+
+    let text = if mark.text.is_empty() {
+        format!("[{}]", mark.frame)
+    } else {
+        mark.text.clone()
+    };
+    state.pause_shown_at = Instant::now();
+    log::info!(
+        "pause mode triggered at frame {frame} (mark {}), previous frame {previous}",
+        mark.frame
+    );
+    send_pause_key(state.state.target_hwnd());
+    state.state.update_ui(|ui, _| {
+        ui.pause_active = true;
+        ui.pause_text = text;
+    });
+}
+
+fn release_pause_display(state: &mut WindowState, battle_state: Option<&str>) {
+    if state.pause_shown_at.elapsed() < PAUSE_MIN_SHOW_DURATION {
+        return;
+    }
+
+    if let Some(battle_state) = battle_state {
+        if is_battle_paused(battle_state) {
+            return;
+        }
+    }
+
+    clear_pause_display(state);
+}
+
+fn is_battle_paused(battle_state: &str) -> bool {
+    matches!(battle_state, "0.2x_paused" | "1x_paused" | "2x_paused")
+}
+
+fn clear_pause_display(state: &mut WindowState) {
+    state.state.update_ui(|ui, _| {
+        ui.pause_active = false;
+        ui.pause_text.clear();
+    });
+}
+
+pub(super) fn focus_game_window(state: &SharedAppState) {
+    let target = state.target_hwnd();
+    if target == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(target as *mut _);
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+fn send_pause_key(target: isize) {
+    const ESC_SCAN: u16 = 0x01;
+    if target == 0 {
+        log::warn!("pause key not sent: capture target window is unknown");
+        return;
+    }
+
+    let key_event = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: ESC_SCAN,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs_down = [key_event(KEYEVENTF_SCANCODE)];
+    let inputs_up = [key_event(KEYBD_EVENT_FLAGS(
+        KEYEVENTF_SCANCODE.0 | KEYEVENTF_KEYUP.0,
+    ))];
+    let input_size = std::mem::size_of::<INPUT>() as i32;
+
+    unsafe {
+        let hwnd = HWND(target as *mut _);
+        if GetForegroundWindow() != hwnd {
+            let _ = SetForegroundWindow(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let foreground = GetForegroundWindow();
+            if foreground != hwnd {
+                log::warn!(
+                    "pause key may have gone to the wrong window: target={target} foreground={}",
+                    foreground.0 as isize
+                );
+            }
+        }
+        let sent_down = SendInput(&inputs_down, input_size);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let sent_up = SendInput(&inputs_up, input_size);
+        if sent_down != 1 || sent_up != 1 {
+            log::warn!("failed to send pause key: down={sent_down} up={sent_up}");
+        }
+    }
 }
 
 fn displayed_calibration_progress(
@@ -745,6 +1223,15 @@ unsafe fn handle_left_up(hwnd: HWND) {
             });
         }
     } else {
+        let in_toolbar = position.y >= LOGICAL_PANEL_H
+            && position.y < LOGICAL_PANEL_H + LOGICAL_TOOLBAR_TOP_GAP + LOGICAL_TOOLBAR_H
+            && position.x >= LOGICAL_W - LOGICAL_TOOLBAR_W - LOGICAL_TOOLBAR_RIGHT_PAD
+            && position.x < LOGICAL_W - LOGICAL_TOOLBAR_RIGHT_PAD;
+        // Focus the game window for every click on the overlay, including the one
+        // that starts a calibration: the capture loop needs the game in front.
+        if !in_toolbar {
+            focus_game_window(&state.state);
+        }
         let _ = state
             .window
             .window()

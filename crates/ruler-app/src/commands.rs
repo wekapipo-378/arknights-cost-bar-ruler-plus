@@ -25,8 +25,26 @@ pub enum UiCommand {
     ResetTimer,
     UndoResetTimer,
     ToggleLapTimer,
+    RecordFrameMark {
+        frame: u64,
+    },
+    TogglePauseMode {
+        enabled: bool,
+    },
+    SelectAxis {
+        name: String,
+    },
+    SetPauseLead {
+        frames: i32,
+    },
     /// Persist the overlay scale multiplier (1.0 == 100%).
     SetOverlayScale(f32),
+    /// Persist the global hotkey bindings (empty string == unbound).
+    SetHotkeys {
+        record_frame: String,
+        pause_mode: String,
+        lap: String,
+    },
     /// Persist the overlay window position (screen pixels).
     SaveOverlayPlacement {
         x: i32,

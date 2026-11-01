@@ -14,3 +14,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Fast iteration build: dependencies fully optimized (image decoding, windows
+# FFI, Slint) while our own crates stay cheap to recompile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

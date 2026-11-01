@@ -188,6 +188,11 @@ pub(super) fn base_config(
         window_class,
         active_calibration_profile: previous
             .and_then(|config| config.active_calibration_profile.clone()),
+        active_axis: previous.and_then(|config| config.active_axis.clone()),
+        pause_lead_frames: previous.and_then(|config| config.pause_lead_frames),
+        hotkey_record_frame: previous.and_then(|config| config.hotkey_record_frame.clone()),
+        hotkey_pause_mode: previous.and_then(|config| config.hotkey_pause_mode.clone()),
+        hotkey_lap: previous.and_then(|config| config.hotkey_lap.clone()),
         frame_display_mode: previous
             .and_then(|config| config.frame_display_mode.clone())
             .or_else(|| Some("0_to_n-1".to_string())),

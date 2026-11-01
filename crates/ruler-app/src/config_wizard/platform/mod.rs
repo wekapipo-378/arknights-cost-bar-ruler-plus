@@ -47,10 +47,11 @@ use windows::{
                 GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, LoadCursorW,
                 RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
                 ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-                HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SWP_NOMOVE, SWP_NOSIZE,
-                SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_DESTROY,
-                WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-                WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+                HMENU, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
+                SM_CXSCREEN, SM_CYSCREEN, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_SETCURSOR, WM_SIZE,
+                WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -59,7 +60,7 @@ use windows::{
 use crate::{
     i18n::I18n,
     slint_win::{
-        create_dib, decode_wm_char, dispatch_key, ensure_platform, logical_pos, present_layered,
+        create_dib, client_xy, decode_wm_char, dispatch_key, ensure_platform, logical_pos, present_layered,
         wide, PreBgra,
     },
     target_discovery::TargetCandidate,
@@ -76,7 +77,7 @@ use probe::{
     drain_probe_messages, re_resolve_adb, refresh_candidates, stop_probe_worker_list, ProbeMessage,
     ProbeWorker,
 };
-use sync::{preview_cap_for_scale, sync_to_slint, wizard_logical_height};
+use sync::{preview_cap_for_scale, sync_to_slint, wizard_adb_banner_height, wizard_logical_height};
 
 const CLASS_NAME: &str = "RulerWizardWindowClass";
 const TIMER_ID: usize = 1;
@@ -89,6 +90,12 @@ const WHEEL_DELTA_UNIT: f32 = 120.0;
 const WHEEL_STEP_LOGICAL_PX: f32 = 60.0;
 // Fixed logical design width of `wizard.slint` (physical = logical * scale).
 const WIZARD_LOGICAL_W: f32 = 560.0;
+// Floor for user resizing. Deliberately much lower than the content's preferred
+// height: the user may want a compact wizard and let Slint squeeze the layout.
+const WIZARD_MIN_LOGICAL_H: f32 = 260.0;
+// Keep the width floor above the footer bar's 456px + margins so the buttons are
+// never clipped, and never squeeze the preview column horizontally.
+const WIZARD_MIN_W: i32 = 600;
 
 /// All mutable wizard data shared between the Slint callbacks and the render
 /// tick. Both run on the single UI thread, so a plain `Rc<RefCell<_>>` is safe.
@@ -150,6 +157,9 @@ struct WizardWindow {
     window: Rc<MinimalSoftwareWindow>,
     core: Rc<RefCell<WizardCore>>,
     closing: Rc<Cell<bool>>,
+    // Kept only so the Slint title-bar drag callback stays wired; the native
+    // drag handler no longer consults it (the whole window is draggable).
+    #[allow(dead_code)]
     drag_on_title: Rc<Cell<bool>>,
     // Currently applied logical window height; the render tick recomputes the
     // target height (debug panel + manual panel toggles) and resizes on change.
@@ -167,6 +177,11 @@ struct WizardWindow {
     moved: bool,
     drag_origin: POINT,
     window_origin: POINT,
+    resize_zone: u8,
+    pending_resize: u8,
+    resize_origin: POINT,
+    resize_rect: RECT,
+    user_sized: bool,
 }
 
 impl Drop for WizardWindow {
@@ -223,7 +238,7 @@ pub(super) fn run_config_wizard(
     }));
     let result: Rc<RefCell<Option<RulerConfig>>> = Rc::new(RefCell::new(None));
     let closing = Rc::new(Cell::new(false));
-    let drag_on_title = Rc::new(Cell::new(false));
+    let drag_on_title = Rc::new(Cell::new(true));
     // Browse buttons stage their file dialog here; the message loop runs it
     // outside the pointer handler's `&mut WizardWindow` borrow (see BrowseAction).
     let pending_browse: Rc<Cell<Option<BrowseAction>>> = Rc::new(Cell::new(None));
@@ -248,8 +263,16 @@ pub(super) fn run_config_wizard(
     refresh_candidates(&mut core.borrow_mut());
 
     let width = (WIZARD_LOGICAL_W * scale).round() as i32;
-    let logical_h = wizard_logical_height(debug, false);
-    let height = (logical_h * scale).round() as i32;
+    // Size for the "adb unavailable" banner as well: it is shown whenever the
+    // initial probe fails, which is exactly the common first-run case. If adb is
+    // fine, the first tick shrinks the window back (the wizard is not user-sized
+    // yet). The result is clamped to the screen so the footer stays visible.
+    let logical_h = wizard_logical_height(debug, false)
+        + wizard_adb_banner_height(!ruler_core::capture::adb_resolver::adb_available());
+    let screen_h_now = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+    let desired_h = (logical_h * scale).round() as i32;
+    // Never taller than the screen, otherwise the footer buttons sit off-screen.
+    let height = desired_h.min((screen_h_now - 40).max(240));
     let _ = window
         .window()
         .try_dispatch_event(WindowEvent::ScaleFactorChanged {
@@ -300,7 +323,7 @@ pub(super) fn run_config_wizard(
             core,
             closing: Rc::clone(&closing),
             drag_on_title,
-            logical_h,
+            logical_h: height as f32 / scale,
             pending_high: Cell::new(0),
             mem_dc,
             dib,
@@ -312,12 +335,17 @@ pub(super) fn run_config_wizard(
             moved: false,
             drag_origin: POINT::default(),
             window_origin: POINT::default(),
+            resize_zone: 0,
+            pending_resize: 0,
+            resize_origin: POINT::default(),
+            resize_rect: RECT::default(),
+            user_sized: false,
         });
         let state_ptr = Box::into_raw(state);
 
-        let title = wide("Arknights Ruler Setup");
+        let title = wide("Cost Bar Ruler Plus Setup");
         let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_LAYERED.0),
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0),
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
             WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
@@ -394,8 +422,14 @@ unsafe fn tick(hwnd: HWND) {
     }
     let debug_expanded = state.wizard.get_debug_expanded();
     let manual_mode = state.core.borrow().manual_mode;
-    let want_h = wizard_logical_height(debug_expanded, manual_mode);
-    if (want_h - state.logical_h).abs() > 0.5 {
+    // Clamp the auto-size to the screen: on a short display the required height
+    // would otherwise push the footer buttons off-screen.
+    let screen_limit = (GetSystemMetrics(SM_CYSCREEN).max(240) - 40) as f32;
+    let max_logical_h = (screen_limit / state.scale).max(300.0);
+    let want_h = (wizard_logical_height(debug_expanded, manual_mode)
+        + wizard_adb_banner_height(state.wizard.get_adb_unavailable()))
+        .min(max_logical_h);
+    if !state.user_sized && (want_h - state.logical_h).abs() > 0.5 {
         resize_wizard(hwnd, state, want_h);
     }
 
@@ -460,6 +494,60 @@ unsafe extern "system" fn window_proc(
             tick(hwnd);
             LRESULT(0)
         }
+        WM_SIZE => {
+            if let Some(state) = wizard_window_mut(hwnd) {
+                let width = (lparam.0 & 0xffff) as i32;
+                let height = ((lparam.0 >> 16) & 0xffff) as i32;
+                if width > 0
+                    && height > 0
+                    && (width as usize != state.buf_w || height as usize != state.buf_h)
+                {
+                    let _ = DeleteDC(state.mem_dc);
+                    let _ = DeleteObject(HGDIOBJ(state.dib.0));
+                    if let Some((mem_dc, dib, bits)) = create_dib(width, height) {
+                        state.mem_dc = mem_dc;
+                        state.dib = dib;
+                        state.bits = bits;
+                        state.buf_w = width as usize;
+                        state.buf_h = height as usize;
+                        state.logical_h = height as f32 / state.scale;
+                    }
+                    state
+                        .window
+                        .set_size(PhysicalSize::new(width as u32, height as u32));
+                }
+            }
+            tick(hwnd);
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            if let Some(state) = wizard_window(hwnd) {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_ok() {
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+                    let zone = wizard_resize_zone(
+                        state.scale,
+                        state.buf_w as i32,
+                        state.buf_h as i32,
+                        point.x,
+                        point.y,
+                    );
+                    let id = match zone {
+                        3 | 12 => Some(IDC_SIZENWSE),
+                        6 | 9 => Some(IDC_SIZENESW),
+                        1 | 4 => Some(IDC_SIZEWE),
+                        2 | 8 => Some(IDC_SIZENS),
+                        _ => Some(IDC_ARROW),
+                    };
+                    if let Some(id) = id {
+                        if let Ok(cursor) = LoadCursorW(HINSTANCE::default(), id) {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SetCursor(cursor);
+                        }
+                    }
+                }
+            }
+            LRESULT(1)
+        }
         WM_MOUSEMOVE => {
             handle_mouse_move(hwnd, lparam);
             LRESULT(0)
@@ -496,17 +584,97 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+fn wizard_resize_zone(scale: f32, width: i32, height: i32, x: i32, y: i32) -> u8 {
+    wizard_resize_zone_m(10.0, scale, width, height, x, y)
+}
+
+fn wizard_resize_zone_m(
+    margin: f32,
+    scale: f32,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+) -> u8 {
+    let _ = (margin, scale);
+    let edge = 8;
+    let corner = 3;
+    let corner_x = if x <= corner {
+        1
+    } else if x >= width - corner - 1 {
+        4
+    } else {
+        0
+    };
+    let corner_y = if y <= corner {
+        2
+    } else if y >= height - corner - 1 {
+        8
+    } else {
+        0
+    };
+    if corner_x != 0 && corner_y != 0 {
+        return corner_x | corner_y;
+    }
+    let edge_x = if x <= edge {
+        1
+    } else if x >= width - edge - 1 {
+        4
+    } else {
+        0
+    };
+    let edge_y = if y <= edge {
+        2
+    } else if y >= height - edge - 1 {
+        8
+    } else {
+        0
+    };
+    edge_x | edge_y
+}
+
 unsafe fn handle_left_down(hwnd: HWND, lparam: LPARAM) {
     let Some(state) = wizard_window_mut(hwnd) else {
         return;
     };
+    let (client_x, client_y) = client_xy(lparam);
+    let zone = wizard_resize_zone(
+        state.scale,
+        state.buf_w as i32,
+        state.buf_h as i32,
+        client_x,
+        client_y,
+    );
+    if zone != 0 {
+        state.resize_zone = zone;
+        state.user_sized = true;
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        state.resize_origin = cursor;
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            state.resize_rect = rect;
+        }
+        let _ = SetCapture(hwnd);
+        return;
+    }
+    state.pending_resize = wizard_resize_zone_m(
+        40.0,
+        state.scale,
+        state.buf_w as i32,
+        state.buf_h as i32,
+        client_x,
+        client_y,
+    );
     let mut cursor = POINT::default();
     let _ = GetCursorPos(&mut cursor);
     let mut rect = RECT::default();
     let _ = GetWindowRect(hwnd, &mut rect);
     state.mouse_down = true;
     state.moved = false;
-    state.drag_on_title.set(false);
+    // Dragging is allowed from anywhere in the window (like the axis window), so
+    // the flag stays `true`; the title-bar callback may set it again, harmlessly.
+    state.drag_on_title.set(true);
     state.drag_origin = cursor;
     state.window_origin = POINT {
         x: rect.left,
@@ -527,15 +695,80 @@ unsafe fn handle_mouse_move(hwnd: HWND, lparam: LPARAM) {
     let Some(state) = wizard_window_mut(hwnd) else {
         return;
     };
-    if state.mouse_down && state.drag_on_title.get() {
+    if state.resize_zone != 0 {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let dx = cursor.x - state.resize_origin.x;
+        let dy = cursor.y - state.resize_origin.y;
+        let mut left = state.resize_rect.left;
+        let mut top = state.resize_rect.top;
+        let mut right = state.resize_rect.right;
+        let mut bottom = state.resize_rect.bottom;
+        if state.resize_zone & 1 != 0 {
+            left += dx;
+        }
+        if state.resize_zone & 2 != 0 {
+            top += dy;
+        }
+        if state.resize_zone & 4 != 0 {
+            right += dx;
+        }
+        if state.resize_zone & 8 != 0 {
+            bottom += dy;
+        }
+        // Low floor on purpose: shrinking below the content's preferred height is
+        // allowed (Slint squeezes the layout instead of blocking the resize).
+        let min_h = ((WIZARD_MIN_LOGICAL_H * state.scale).round() as i32)
+            .min(GetSystemMetrics(SM_CYSCREEN).max(240) - 20);
+        let min_w = WIZARD_MIN_W;
+        let mut width = right - left;
+        let mut height = bottom - top;
+        if width < min_w {
+            width = min_w;
+            if state.resize_zone & 1 != 0 {
+                left = right - min_w;
+            }
+        }
+        if height < min_h {
+            height = min_h;
+            if state.resize_zone & 2 != 0 {
+                top = bottom - min_h;
+            }
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            left,
+            top,
+            width,
+            height,
+            SWP_NOZORDER,
+        );
+        return;
+    }
+    // Dragging works from anywhere in the window (like the axis window); the
+    // `drag_on_title` flag from the Slint title-bar callback is intentionally not
+    // consulted here so its press/release toggling cannot disable it.
+    if state.mouse_down {
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);
         let dx = cursor.x - state.drag_origin.x;
         let dy = cursor.y - state.drag_origin.y;
-        if dx.abs() > 2 || dy.abs() > 2 {
+        if dx.abs() > 3 || dy.abs() > 3 {
             state.moved = true;
         }
         if state.moved {
+            if state.pending_resize != 0 {
+                state.resize_zone = state.pending_resize;
+                state.pending_resize = 0;
+                state.mouse_down = false;
+                state.resize_origin = state.drag_origin;
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    state.resize_rect = rect;
+                }
+                return;
+            }
             let _ = SetWindowPos(
                 hwnd,
                 HWND::default(),
@@ -586,15 +819,22 @@ unsafe fn handle_left_up(hwnd: HWND) {
     let Some(state) = wizard_window_mut(hwnd) else {
         return;
     };
-    let moved = state.moved && state.drag_on_title.get();
+    if state.resize_zone != 0 {
+        state.resize_zone = 0;
+        state.user_sized = true;
+        let _ = ReleaseCapture();
+        return;
+    }
+    state.pending_resize = 0;
+    let moved = state.moved;
     state.mouse_down = false;
     state.moved = false;
-    state.drag_on_title.set(false);
+    state.drag_on_title.set(true);
     let _ = ReleaseCapture();
 
     if moved {
-        // Finished a title-bar drag; cancel Slint's press grab so it is not
-        // read as a click.
+        // Finished a window drag; cancel Slint's press grab so it is not read as
+        // a click.
         let _ = state
             .window
             .window()

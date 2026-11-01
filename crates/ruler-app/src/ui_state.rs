@@ -1,4 +1,6 @@
 pub const FRAMES_PER_SECOND: i32 = 30;
+/// Auto-pause pauses this many frames *before* the mark unless configured.
+pub const DEFAULT_PAUSE_LEAD_FRAMES: i32 = 3;
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// What triggered a timer reset — drives the overlay cover animation's label.
@@ -78,6 +80,12 @@ impl Default for OverlayMode {
     fn default() -> Self {
         Self::Booting
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PauseMark {
+    pub frame: u32,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -211,10 +219,27 @@ pub struct UiSnapshot {
     pub can_undo_reset: bool,
     pub total_frames_in_cycle: i32,
     pub active_profile: Option<String>,
+    /// Axis file name currently in use (amber label in the HUD's top-left).
+    pub active_axis_name: Option<String>,
     pub display_mode: FrameDisplayMode,
+    pub global_frame: u64,
+    pub mark_str: String,
+    pub pause_mode: bool,
+    pub pause_active: bool,
+    pub pause_text: String,
+    pub pause_marks: Vec<PauseMark>,
+    pub pause_lead_frames: i32,
+    pub pause_marks_generation: u32,
     pub profiles: Vec<ProfileMenuItem>,
     pub capture_dimensions: Option<(u32, u32)>,
     pub overlay_scale_pct: u16,
+    /// Global hotkey bindings ("" == unbound).
+    pub hotkey_record_frame: String,
+    pub hotkey_pause_mode: String,
+    pub hotkey_lap: String,
+    /// Bumped whenever the appearance/hotkey block changes so the overlay can
+    /// re-apply colours and re-register hotkeys.
+    pub appearance_generation: u32,
     pub should_exit: bool,
     pub cursor_blocked: bool,
     pub update_notice: Option<UpdateNotice>,
@@ -238,10 +263,23 @@ impl Default for UiSnapshot {
             can_undo_reset: false,
             total_frames_in_cycle: 0,
             active_profile: None,
+            active_axis_name: None,
             display_mode: FrameDisplayMode::ZeroToNMinusOne,
+            global_frame: 0,
+            mark_str: String::new(),
+            pause_mode: false,
+            pause_active: false,
+            pause_text: String::new(),
+            pause_marks: Vec::new(),
+            pause_lead_frames: DEFAULT_PAUSE_LEAD_FRAMES,
+            pause_marks_generation: 0,
             profiles: Vec::new(),
             capture_dimensions: None,
             overlay_scale_pct: 100,
+            hotkey_record_frame: String::new(),
+            hotkey_pause_mode: String::new(),
+            hotkey_lap: String::new(),
+            appearance_generation: 0,
             should_exit: false,
             cursor_blocked: false,
             update_notice: None,

@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod arknights_settings;
 mod calibration;
+mod clipboard;
 mod commands;
 mod config_wizard;
 mod debug_recorder;
@@ -22,11 +23,9 @@ mod resources;
 #[cfg(windows)]
 mod slint_win;
 mod target_discovery;
-mod telemetry;
 mod tray;
 mod ui;
 mod ui_state;
-mod update_check;
 mod worker;
 
 use app::RulerApp;

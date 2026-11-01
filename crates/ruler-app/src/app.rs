@@ -15,8 +15,6 @@ use crate::{
     overlay::{OverlayPlacement, OverlayRuntime},
     resources::ResourceLocator,
     target_discovery::{discover_targets, probe_candidate_once},
-    telemetry::ensure_config_uuid,
-    update_check::spawn_update_check,
     worker::{SharedAppState, StartupStatus, WorkerRuntime},
 };
 
@@ -41,7 +39,6 @@ impl RulerApp {
         let i18n = Arc::new(I18n::load(&resources, preferred_locale));
 
         let state = Arc::new(SharedAppState::default());
-        spawn_update_check(Arc::clone(&state));
 
         let startup_status =
             resolve_startup_config(&resources, &i18n, Arc::clone(&state), initial_status, debug)?;
@@ -191,14 +188,13 @@ fn resolve_startup_config(
     // --debug: force the config wizard regardless of current config.
     if debug {
         log::info!("debug mode: forcing config wizard");
-        if let Some(mut config) = run_config_wizard(
+        if let Some(config) = run_config_wizard(
             resources,
             i18n,
             Arc::clone(&state),
             previous_config.as_ref(),
             true,
         ) {
-            ensure_config_uuid(&mut config);
             config
                 .save_to_path(resources.config_path())
                 .map_err(|error| StartupError::new(error.to_string()))?;
@@ -225,8 +221,6 @@ fn resolve_startup_config(
         if config.auto_select_target {
             match try_auto_select_config(config) {
                 Ok(Some(config)) => {
-                    let mut config = config;
-                    ensure_config_uuid(&mut config);
                     config
                         .save_to_path(resources.config_path())
                         .map_err(|error| StartupError::new(error.to_string()))?;
@@ -249,14 +243,13 @@ fn resolve_startup_config(
         }
     }
 
-    if let Some(mut config) = run_config_wizard(
+    if let Some(config) = run_config_wizard(
         resources,
         i18n,
         Arc::clone(&state),
         previous_config.as_ref(),
         false,
     ) {
-        ensure_config_uuid(&mut config);
         config
             .save_to_path(resources.config_path())
             .map_err(|error| StartupError::new(error.to_string()))?;
@@ -270,14 +263,11 @@ fn resolve_startup_config(
         ));
     }
 
-    Ok(StartupStatus::invalid(
-        config_path_text,
-        format!(
-            "{}: {}",
-            initial_status.phase,
-            i18n.tr("config.selector.cancelled")
-        ),
-    ))
+    Err(StartupError::new(format!(
+        "{}: {}",
+        initial_status.phase,
+        i18n.tr("config.selector.cancelled")
+    )))
 }
 
 fn try_auto_select_config(config: &RulerConfig) -> Result<Option<RulerConfig>, String> {

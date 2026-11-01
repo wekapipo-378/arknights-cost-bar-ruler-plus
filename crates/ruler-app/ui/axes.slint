@@ -1,0 +1,489 @@
+import { Palette, Icons, IconBtn, Chip } from "theme.slint";
+
+export struct AxisRow {
+    name: string,
+    count: string,
+    active: bool,
+}
+
+export struct FrameRow {
+    frame: string,
+    note: string,
+    current: bool,
+}
+
+export component AxesPanel inherits Window {
+    in property <[AxisRow]> rows;
+    in property <[FrameRow]> frames;
+    in property <bool> detail: false;
+    in property <string> heading: "轴列表";
+    in property <string> label-empty: "还没有轴";
+    in property <string> label-empty-frames: "还没有帧";
+    in property <bool> pinned: false;
+    in property <bool> follow: true;
+    in-out property <length> scroll-y: 0px;
+    in-out property <int> editing-index: -1;
+    in-out property <int> frame-editing: -1;
+    // Inline rename of the axis that is currently open (click its title).
+    in-out property <bool> heading-editing: false;
+    in-out property <string> heading-edit-text: "";
+    in-out property <int> edit-field: 1;
+    in-out property <int> select-all-pulse: 0;
+    in-out property <string> focus-text: "";
+    in-out property <string> axis-edit-text: "";
+
+    callback new-axis();
+    callback close-window();
+    callback toggle-pin();
+    callback toggle-follow();
+    callback back();
+    callback select-axis(int);
+    callback commit-rename(int, string);
+    callback cancel-rename();
+    callback commit-heading-rename(string);
+    callback cancel-heading-rename();
+    callback copy-axis(int);
+    callback delete-axis(int);
+    callback new-frame();
+    callback commit-frame-edit(int, string, string);
+    callback save-frame-edit(int, string, string);
+    callback finish-frame-edit();
+    callback cancel-frame-edit();
+    callback delete-frame(int);
+
+    background: transparent;
+    default-font-family: "Bender";
+    preferred-width: 300px;
+    preferred-height: 420px;
+
+    property <length> row-h: 30px;
+    property <length> control-h: 22px;
+    property <length> icon-glyph: 16px;
+
+    Rectangle {
+        background: #0b1016f8;
+        border-width: 1px;
+        border-color: Palette.hairline;
+    }
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 2px;
+        background: Palette.accent;
+        opacity: 0.9;
+    }
+
+    VerticalLayout {
+        padding-top: 8px;
+        padding-bottom: 8px;
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 0px;
+
+        if (!root.detail): VerticalLayout {
+            Rectangle {
+                height: root.row-h;
+                HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    spacing: 6px;
+                    IconBtn {
+                        icon: Icons.cross;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        danger: true;
+                        clicked => { root.close-window(); }
+                    }
+                    Text {
+                        text: root.heading;
+                        color: Palette.text-faint;
+                        font-size: 10px;
+                        letter-spacing: 1px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Chip {
+                        width: 40px;
+                        label: "置顶";
+                        selected: root.pinned;
+                        clicked => { root.toggle-pin(); }
+                    }
+                    IconBtn {
+                        icon: Icons.plus;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => { root.new-axis(); }
+                    }
+                }
+            }
+
+            if (root.rows.length == 0): Rectangle {
+                height: root.row-h;
+                Text {
+                    text: root.label-empty;
+                    color: Palette.text-faint;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+            for row[idx] in root.rows: Rectangle {
+                height: root.row-h;
+                background: root.editing-index == idx ? transparent
+                    : (rta.has-hover ? #ffffff14 : transparent);
+                animate background { duration: 90ms; }
+
+                rta := TouchArea {
+                    enabled: root.editing-index != idx;
+                    clicked => { root.select-axis(idx); }
+                }
+
+                if (root.editing-index != idx): HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    padding-left: 2px;
+                    spacing: 3px;
+                    Rectangle {
+                        width: 12px;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 3px;
+                            background: row.active ? Palette.accent : transparent;
+                        }
+                    }
+                    Text {
+                        text: row.name;
+                        color: Palette.text-primary;
+                        font-size: 13px;
+                        font-weight: row.active ? 700 : 500;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: row.count;
+                        color: Palette.text-secondary;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    IconBtn {
+                        icon: Icons.pencil;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => { root.editing-index = idx; }
+                    }
+                    IconBtn {
+                        icon: Icons.plus;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => { root.copy-axis(idx); }
+                    }
+                    IconBtn {
+                        icon: Icons.cross;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        danger: true;
+                        clicked => { root.delete-axis(idx); }
+                    }
+                }
+
+                if (root.editing-index == idx): HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    padding-left: 2px;
+                    spacing: 3px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: root.control-h;
+                        border-width: 1px;
+                        border-color: Palette.accent;
+                        background: #ffffff10;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            axis-edit := TextInput {
+                                color: Palette.text-primary;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                single-line: true;
+                                selection-background-color: Palette.accent-dim;
+                                selection-foreground-color: Palette.text-primary;
+                                init => {
+                                    self.text = row.name;
+                                    root.axis-edit-text = row.name;
+                                    self.select-all();
+                                    self.focus();
+                                }
+                                edited => {
+                                    root.axis-edit-text = self.text;
+                                    root.focus-text = self.text;
+                                }
+                                accepted => {
+                                    root.commit-rename(idx, self.text);
+                                    root.editing-index = -1;
+                                }
+                            }
+                        }
+                    }
+                    IconBtn {
+                        icon: Icons.cross;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => {
+                            root.axis-edit-text = "";
+                            root.cancel-rename();
+                            root.editing-index = -1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (root.detail): VerticalLayout {
+            Rectangle {
+                height: root.row-h;
+                HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    spacing: 6px;
+                    IconBtn {
+                        icon: Icons.chev-left;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => { root.back(); }
+                    }
+                    if (root.heading-editing): Rectangle {
+                        horizontal-stretch: 1;
+                        height: root.control-h;
+                        border-width: 1px;
+                        border-color: Palette.hairline-faint;
+                        background: #ffffff10;
+                        HorizontalLayout {
+                            padding-left: 4px;
+                            padding-right: 4px;
+                            edit-heading := TextInput {
+                                color: Palette.text-primary;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                single-line: true;
+                                selection-background-color: Palette.accent-dim;
+                                selection-foreground-color: Palette.text-primary;
+                                init => {
+                                    self.text = root.heading;
+                                    self.select-all();
+                                    self.focus();
+                                }
+                                edited => { root.heading-edit-text = self.text; }
+                                accepted => {
+                                    root.commit-heading-rename(self.text);
+                                    root.heading-editing = false;
+                                }
+                            }
+                        }
+                    }
+                    if (!root.heading-editing): Text {
+                        text: root.heading;
+                        color: Palette.text-primary;
+                        font-size: 13px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        // Click the axis title to rename it, exactly like a note.
+                        heading-ta := TouchArea {
+                            clicked => {
+                                root.heading-edit-text = root.heading;
+                                root.heading-editing = true;
+                            }
+                        }
+                    }
+                    Chip {
+                        width: 40px;
+                        label: "跟随";
+                        selected: root.follow;
+                        clicked => { root.toggle-follow(); }
+                    }
+                    Chip {
+                        width: 40px;
+                        label: "置顶";
+                        selected: root.pinned;
+                        clicked => { root.toggle-pin(); }
+                    }
+                    IconBtn {
+                        icon: Icons.plus;
+                        height: root.control-h;
+                        glyph: root.icon-glyph;
+                        clicked => { root.new-frame(); }
+                    }
+                }
+            }
+
+            if (root.frames.length == 0): Rectangle {
+                height: root.row-h;
+                Text {
+                    text: root.label-empty-frames;
+                    color: Palette.text-faint;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                VerticalLayout {
+                    y: -root.scroll-y;
+                    width: 100%;
+                    for frame-row[idx] in root.frames: Rectangle {
+                        height: root.row-h;
+                        background: root.frame-editing == idx ? transparent
+                            : (frame-row.current ? Palette.accent.with-alpha(0.12) : (fta.has-hover || frame-num-ta.has-hover ? #ffffff14 : transparent));
+                        animate background { duration: 90ms; }
+
+                        fta := TouchArea {
+                            enabled: root.frame-editing != idx;
+                            clicked => {
+                                root.edit-field = 1;
+                                root.frame-editing = idx;
+                            }
+                        }
+
+                        if (root.frame-editing != idx): HorizontalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            padding-left: 2px;
+                            spacing: 4px;
+                            Rectangle {
+                                width: 12px;
+                                Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3px;
+                                    background: frame-row.current ? Palette.accent : transparent;
+                                }
+                            }
+                            Text {
+                                text: frame-row.frame;
+                                color: Palette.text-primary;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                width: 48px;
+                            }
+                            Text {
+                                text: frame-row.note;
+                                color: Palette.text-secondary;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            IconBtn {
+                                icon: Icons.cross;
+                                height: root.control-h;
+                                glyph: root.icon-glyph;
+                                danger: true;
+                                clicked => { root.delete-frame(idx); }
+                            }
+                        }
+
+                        frame-num-ta := TouchArea {
+                            x: 16px;
+                            y: 0;
+                            width: 48px;
+                            height: 100%;
+                            enabled: root.frame-editing != idx;
+                            clicked => {
+                                root.edit-field = 0;
+                                root.frame-editing = idx;
+                            }
+                        }
+
+                        if (root.frame-editing == idx): HorizontalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            padding-left: 2px;
+                            spacing: 3px;
+                            Rectangle {
+                                width: 52px;
+                                height: root.control-h;
+                                border-width: 1px;
+                                border-color: Palette.hairline-faint;
+                                background: #ffffff10;
+                                HorizontalLayout {
+                                    padding-left: 4px;
+                                    padding-right: 4px;
+                                    edit-frame := TextInput {
+                                        color: Palette.text-primary;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        selection-background-color: Palette.accent-dim;
+                                        selection-foreground-color: Palette.text-primary;
+                                        init => {
+                                            self.text = frame-row.frame;
+                                            if (root.edit-field == 0) {
+                                                self.select-all();
+                                                self.focus();
+                                            }
+                                        }
+                                        edited => {
+                                            root.focus-text = self.text;
+                                            root.save-frame-edit(idx, self.text, edit-note.text);
+                                        }
+                                        accepted => {
+                                            root.save-frame-edit(idx, self.text, edit-note.text);
+                                            root.finish-frame-edit();
+                                            root.frame-editing = -1;
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: root.control-h;
+                                border-width: 1px;
+                                border-color: Palette.hairline-faint;
+                                background: #ffffff10;
+                                HorizontalLayout {
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    edit-note := TextInput {
+                                        color: Palette.text-primary;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        selection-background-color: Palette.accent-dim;
+                                        selection-foreground-color: Palette.text-primary;
+                                        init => {
+                                            self.text = frame-row.note;
+                                            if (root.edit-field != 0) {
+                                                self.select-all();
+                                                self.focus();
+                                            }
+                                        }
+                                        edited => {
+                                            root.focus-text = self.text;
+                                            root.save-frame-edit(idx, edit-frame.text, self.text);
+                                        }
+                                        accepted => {
+                                            root.save-frame-edit(idx, edit-frame.text, self.text);
+                                            root.finish-frame-edit();
+                                            root.frame-editing = -1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

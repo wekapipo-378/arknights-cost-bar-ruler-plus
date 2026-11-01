@@ -28,9 +28,9 @@ use slint::{
 use windows::Win32::{
     Foundation::{COLORREF, HWND, LPARAM, POINT, SIZE},
     Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
         AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-        DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+        DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
     },
     UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA},
 };
@@ -193,6 +193,21 @@ pub(crate) unsafe fn present_layered(hwnd: HWND, mem_dc: HDC, width: i32, height
         ULW_ALPHA,
     );
     let _ = ReleaseDC(HWND::default(), screen);
+}
+
+/// Blit the framebuffer straight into a normal (non-layered) window client area.
+///
+/// The settings window now hosts native controls instead of a software-rendered
+/// Slint surface, so nothing calls this at the moment; kept for the remaining
+/// DIB-based windows and for the migration notes in `docs/`.
+#[allow(dead_code)]
+pub(crate) unsafe fn present_blt(hwnd: HWND, mem_dc: HDC, width: i32, height: i32) {
+    let screen = GetDC(hwnd);
+    if screen.is_invalid() {
+        return;
+    }
+    let _ = BitBlt(screen, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+    let _ = ReleaseDC(hwnd, screen);
 }
 
 /// Logical pointer position from an `LPARAM`-packed client coordinate.

@@ -1,4 +1,4 @@
-# Build script for ArknightsCostBarRuler (Rust version)
+# Build script for CostBarRulerPlus (based on ArknightsCostBarRuler by Z_06)
 # Usage: .\build.ps1 [release|debug]
 
 param(
@@ -11,9 +11,22 @@ $ErrorActionPreference = "Stop"
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ROOT
 
+# Stop a running instance so the old exe is not locked during cleanup
+Get-Process -Name "CostBarRulerPlus" -ErrorAction SilentlyContinue | ForEach-Object {
+    try { $_.Kill() } catch { }
+}
+Start-Sleep -Milliseconds 400
+
 # Clean dist directory
 if (Test-Path "dist") {
-    Remove-Item -Recurse -Force "dist"
+    try {
+        Remove-Item -Recurse -Force "dist" -ErrorAction Stop
+    }
+    catch {
+        Write-Host "ERROR: cannot remove 'dist' - close the running CostBarRulerPlus.exe first" -ForegroundColor Red
+        Write-Host "       (tray icon -> exit, or Task Manager -> CostBarRulerPlus.exe -> end task)" -ForegroundColor Red
+        exit 1
+    }
 }
 
 $buildArgs = @("build")
@@ -32,7 +45,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Determine output directory
 $targetDir = if ($Profile -eq "release") { "target\release" } else { "target\debug" }
-$exePath = Join-Path $targetDir "ruler-app.exe"
+$exePath = Join-Path $targetDir "CostBarRulerPlus.exe"
 
 if (-not (Test-Path $exePath)) {
     Write-Host "ERROR: Built binary not found at $exePath" -ForegroundColor Red
@@ -40,7 +53,7 @@ if (-not (Test-Path $exePath)) {
 }
 
 # Prepare distribution directory
-$distDir = "dist\ArknightsCostBarRuler"
+$distDir = "dist\CostBarRulerPlus"
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 # Copy binary
@@ -61,4 +74,4 @@ if (Test-Path "LICENSES") {
     Copy-Item -Recurse LICENSES -Destination $distDir
 }
 
-Write-Host "Build complete. Binary at $distDir\ruler-app.exe" -ForegroundColor Green
+Write-Host "Build complete. Binary at $distDir\CostBarRulerPlus.exe" -ForegroundColor Green

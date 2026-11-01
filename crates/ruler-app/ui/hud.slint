@@ -3,12 +3,13 @@
 // Rendered by the software renderer into a per-pixel-alpha layered window.
 // All user-facing strings are localized in Rust and pushed in as properties.
 
-import { Palette, Icons, IconBtn } from "theme.slint";
+import { Palette, Icons, IconBtn, Chip } from "theme.slint";
 
 // Secondary surfaces live in their own files; re-export so `include_modules!`
 // exposes them to Rust alongside `Hud`.
 export { RulerMenu, ProfileRow } from "menu.slint";
 export { Wizard, TargetRow } from "wizard.slint";
+export { AxesPanel, AxisRow } from "axes.slint";
 
 export enum HudMode {
     booting,
@@ -37,6 +38,15 @@ export component Hud inherits Window {
     in property <bool> update-available: false;
     in property <string> update-text: "";
 
+    in property <string> mark-str: "";
+    // Frame number of the next pause mark, shown at the bottom-right.
+    in property <string> next-mark-str: "";
+    // Name of the axis file currently in use, shown in amber at the top-left.
+    in property <string> axis-str: "";
+    in property <bool> pause-mode: false;
+    // Text of the auto-pause lead, e.g. "-2"; empty when pause mode is off.
+    in property <string> pause-lead-str: "";
+
     // ---- reset cover animation (driven from Rust each tick) ----
     // A cyan bar sweeps down from the top to cover the panel, holds, then
     // wipes downward off the bottom. `reset-cover` is the bar's height as a
@@ -52,12 +62,12 @@ export component Hud inherits Window {
 
     // ---- outputs ----
     callback start-clicked();
-    callback reset-clicked();
-    callback undo-reset-clicked();
     callback lap-clicked();
-    callback back-cycle();
-    callback fwd-cycle();
     callback open-update();
+    callback close-clicked();
+    callback settings-clicked();
+    callback record-frame-clicked();
+    callback pause-mode-clicked();
     callback bg-pressed();
     callback bg-released();
 
@@ -177,6 +187,37 @@ export component Hud inherits Window {
                 horizontal-alignment: left;
             }
         }
+
+        // current frame + note of that frame (amber, always)
+        Text {
+            visible: root.mark-str != "";
+            x: 13px;
+            y: 43px;
+            width: 118px;
+            height: 12px;
+            text: root.mark-str;
+            color: Palette.amber;
+            font-size: 10px;
+            font-weight: 600;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // next pause mark (bottom-right, mirrored 13px margin, amber)
+        Text {
+            visible: root.next-mark-str != "";
+            x: 131px;
+            y: 43px;
+            width: 66px;
+            height: 12px;
+            text: root.next-mark-str;
+            color: Palette.amber;
+            font-size: 10px;
+            font-weight: 600;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
     }
 
     // ===== CALIBRATING: thin progress line + percent =====
@@ -237,6 +278,40 @@ export component Hud inherits Window {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
+    }
+
+    // ===== ACTIVE AXIS NAME (amber, top-left, visible in every mode) =====
+    // Panel-level on purpose: it used to live inside `running-layer`, so it was
+    // invisible whenever no profile was running (idle / prepare-calibration).
+    Text {
+        visible: root.axis-str != "";
+        x: 13px;
+        y: 3px;
+        width: 180px;
+        height: 11px;
+        text: root.axis-str;
+        color: Palette.amber;
+        font-size: 9px;
+        font-weight: 600;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // ===== AUTO-PAUSE INDICATOR (amber, top-right) =====
+    // Shown only while pause mode is armed: "-N" lead frames, text only.
+    Text {
+        visible: root.pause-mode && root.pause-lead-str != "";
+        x: 118px;
+        y: 2px;
+        width: 79px;
+        height: 12px;
+        text: root.pause-lead-str;
+        color: Palette.amber;
+        font-size: 10px;
+        font-weight: 600;
+        horizontal-alignment: right;
+        vertical-alignment: center;
     }
 
     // ===== RESET COVER: cyan bar wipes down over the panel, then wipes off =====
@@ -319,7 +394,7 @@ export component Hud inherits Window {
         }
 
         Rectangle {
-            width: 134px;
+            width: 150px;
             height: root.toolbar-height;
             x: parent.width - self.width - 4px;
             y: root.panel-height + 2px;
@@ -334,11 +409,11 @@ export component Hud inherits Window {
                 padding: 2px;
                 spacing: 2px;
                 alignment: center;
-                IconBtn { icon: Icons.prev; clicked => { root.back-cycle(); } }
-                IconBtn { icon: Icons.undo-reset; enabled: root.undo-reset-enabled; clicked => { root.undo-reset-clicked(); } }
-                IconBtn { icon: Icons.reset; clicked => { root.reset-clicked(); } }
+                IconBtn { icon: Icons.power; danger: true; clicked => { root.close-clicked(); } }
+                Chip { width: 40px; label: "设置"; clicked => { root.settings-clicked(); } }
                 IconBtn { icon: Icons.flag; strong: root.lap-str != ""; clicked => { root.lap-clicked(); } }
-                IconBtn { icon: Icons.next; clicked => { root.fwd-cycle(); } }
+                IconBtn { icon: Icons.bookmark-add; clicked => { root.record-frame-clicked(); } }
+                IconBtn { icon: Icons.timer; strong: root.pause-mode; clicked => { root.pause-mode-clicked(); } }
             }
         }
     }
